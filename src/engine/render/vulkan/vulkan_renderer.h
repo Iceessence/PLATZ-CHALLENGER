@@ -58,18 +58,28 @@ struct GpuTextureResource {
     VulkanImage image;
     VkSampler sampler{VK_NULL_HANDLE};
     VkDescriptorSet imguiDescriptorSet{VK_NULL_HANDLE};
+    VkDescriptorSet sceneDescriptorSets[VulkanContext::kMaxFramesInFlight]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    bool pixelExactNearest{false};
     uint64_t assetGeneration{0};
 };
 
 struct FramePerfMetrics {
-    double cpuFrameTimeMs{0.0};
-    double gpuScenePassTimeMs{0.0};
+    double cpuFrameTimeMs{0.0};        // Total wall-clock frame duration including present/VSync wait
+    double cpuActiveWorkMs{0.0};       // Active CPU work only (sync + UI + command record + submit)
+    double cpuSceneSyncMs{0.0};        // CPU asset/modifier sync stage
+    double cpuUiBuildMs{0.0};          // Dear ImGui frame build & tessellation stage
+    double cpuCommandRecordMs{0.0};    // Vulkan command buffer recording stage
+    double cpuQueueSubmitMs{0.0};      // vkQueueSubmit CPU overhead
+    double cpuPresentWaitMs{0.0};      // Fence wait + vkAcquireNextImageKHR + vkQueuePresentKHR (VSync)
+    double gpuScenePassTimeMs{0.0};    // Hardware GPU timestamp delta for 3D offscreen pass
     uint32_t drawCallCount{0};
     uint32_t triangleCount{0};
     uint64_t renderedFrameCount{0};
     uint32_t viewportWidth{0};
     uint32_t viewportHeight{0};
     uint32_t rebuiltCacheCount{0};
+    uint64_t gpuSyncSkipsCount{0};     // O(1) mutation-generation sync fast-path hits
+    std::string presentModeName{"FIFO"};
 };
 
 class VulkanRenderer {
@@ -117,7 +127,14 @@ public:
     // Read back rendered offscreen 3D viewport pixels from GPU to CPU
     bool ReadbackViewportColorRgba(creative::ImageData2D* outImage, std::string* outError = nullptr);
 
-    // Read back the full composed Studio application window from the last presented swapchain image
+    // Opt-in swapchain framebuffer capture for the next interactive frame (avoids 8MB/frame transfer overhead during normal rendering)
+    void RequestSwapchainCapture() { captureNextSwapchainFrame_ = true; }
+
+    // Configure swapchain present mode before Initialize() (true = FIFO VSync, false = MAILBOX/IMMEDIATE unlocked benchmark)
+    void SetPreferVsync(bool preferVsync) { preferVsyncFifo_ = preferVsync; }
+    bool GetPreferVsync() const { return preferVsyncFifo_; }
+
+    // Read back the full composed Studio application window from the last captured swapchain image
     bool ReadbackSwapchainWindowRgba(creative::ImageData2D* outImage, std::string* outError = nullptr);
 
     // Read back exact 32-bit ObjectId from the GPU picking attachment at (pixelX, pixelY) (PLZ-RENDER-001, N-01)
@@ -212,6 +229,8 @@ private:
     VkFormat swapchainFormat_{VK_FORMAT_B8G8R8A8_UNORM};
     VkExtent2D swapchainExtent_{0, 0};
     bool swapchainSupportsTransferSrc_{false};
+    bool preferVsyncFifo_{true};
+    bool captureNextSwapchainFrame_{false};
     uint32_t lastPresentedSwapchainImageIndex_{0};
     bool hasPresentedSwapchainFrame_{false};
     VulkanBuffer lastSwapchainCaptureBuffer_{};
@@ -238,11 +257,14 @@ private:
     VkPipeline pbrPipeline_{VK_NULL_HANDLE};
     VkPipeline gridPipeline_{VK_NULL_HANDLE};
 
-    // Built-in & Project-derived GPU caches
+    // Built-in & Project-derived GPU caches (CPU-evaluated modifiers uploaded to VMA device buffers + per-asset GPU textures)
     std::map<std::string, creative::MeshData> cpuPrimitiveBaseMeshes_;
     std::map<std::string, GpuMeshResource> primitiveMeshes_;
     std::map<core::AssetId, GpuMeshResource> customAssetMeshes_;
+    std::map<core::AssetId, GpuTextureResource> customAssetTextures_;
     std::map<core::ObjectId, GpuMeshResource> modifiedObjectMeshes_;
+    uint64_t lastSyncedProjectGeneration_{0};
+    bool derivedCachesDirty_{true};
     GpuMeshResource worldGridMesh_;
     GpuTextureResource defaultCalibrationTexture_;
     GpuTextureResource pixelArtPreviewTexture_;

@@ -1,4 +1,5 @@
 #include "engine/runtime/runtime_session.h"
+#include "platform/audio_engine.h"
 #include "platform/platform_paths.h"
 
 #include <algorithm>
@@ -6,6 +7,82 @@
 #include <set>
 
 namespace platz::engine::runtime {
+
+namespace {
+
+glm::vec3 SampleAnimationTrack(const core::AnimationTrack& track, float t) {
+    if (track.keyframes.empty()) return glm::vec3(0.0f);
+    if (track.keyframes.size() == 1 || t <= track.keyframes.front().timeSec) {
+        return track.keyframes.front().value;
+    }
+    if (t >= track.keyframes.back().timeSec) {
+        return track.keyframes.back().value;
+    }
+
+    for (size_t i = 0; i + 1 < track.keyframes.size(); ++i) {
+        const auto& k0 = track.keyframes[i];
+        const auto& k1 = track.keyframes[i + 1];
+        if (t >= k0.timeSec && t <= k1.timeSec) {
+            float span = k1.timeSec - k0.timeSec;
+            if (span <= 1e-6f) return k1.value;
+            float u = std::clamp((t - k0.timeSec) / span, 0.0f, 1.0f);
+            if (k0.interpolation == "Step") {
+                return k0.value;
+            }
+            if (k0.interpolation == "EaseInOut") {
+                u = u * u * (3.0f - 2.0f * u);
+            }
+            return glm::mix(k0.value, k1.value, u);
+        }
+    }
+    return track.keyframes.back().value;
+}
+
+} // namespace
+
+void RuntimeSession::EvaluateObjectAnimationAtTime(core::SceneObject& obj, double timeSec) {
+    if (!obj.animation.enabled || obj.animation.tracks.empty()) return;
+    float duration = std::max(0.05f, obj.animation.durationSec);
+    float t = static_cast<float>(std::max(0.0, timeSec));
+    if (obj.animation.loop) {
+        t = std::fmod(t, duration);
+    } else {
+        t = std::min(t, duration);
+    }
+
+    for (const auto& track : obj.animation.tracks) {
+        if (track.keyframes.empty()) continue;
+        glm::vec3 val = SampleAnimationTrack(track, t);
+        if (track.targetProperty == "position") {
+            obj.transform.position = val;
+        } else if (track.targetProperty == "rotationEulerDeg") {
+            obj.transform.rotationEulerDeg = val;
+        } else if (track.targetProperty == "scale") {
+            obj.transform.scale = val;
+        } else if (track.targetProperty == "emissiveStrength") {
+            obj.material.emissiveStrength = std::clamp(val.x, 0.0f, 16.0f);
+        }
+    }
+    obj.transform.Sanitize();
+}
+
+void RuntimeSession::TriggerSpatialCueIfConfigured(const core::SceneObject& obj, const std::string& overrideCue) {
+    if (!audioEngine_ || !audioEngine_->IsInitialized()) return;
+    if (!obj.audio.enabled && overrideCue.empty()) return;
+
+    platform::SpatialAudioCueRequest cue;
+    cue.cueType = overrideCue.empty() ? obj.audio.cueType : overrideCue;
+    cue.sourceWorldPos = obj.transform.position;
+    cue.volume = std::clamp(obj.audio.volume, 0.0f, 1.0f);
+    cue.pitch = std::clamp(obj.audio.pitch, 0.25f, 4.0f);
+    cue.maxDistance = std::max(1.0f, obj.audio.maxDistance);
+    cue.spatial3D = obj.audio.spatial3D;
+    cue.lowPassCutoffHz = std::clamp(obj.audio.lowPassCutoffHz, 200.0f, 20000.0f);
+
+    if (audioEngine_->PlaySpatialCue(cue, listenerPos_, listenerRight_)) {
+        ++metrics_.audioCuesTriggeredCount;
+    }
+}
 
 std::vector<LogicDiagnostic> RuntimeSession::ValidateProjectLogic(const core::ProjectState& project) {
     std::vector<LogicDiagnostic> diags;
@@ -220,7 +297,6 @@ void RuntimeSession::ExecuteRuleAction(core::SceneObject& self, const core::Beha
         self.transform.position.x = std::cos(angle) * radius;
         self.transform.position.z = std::sin(angle) * radius;
     } else if (rule.actionType == "PatrolWaypoints") {
-        // Patrol back and forth along X/Z span around origin_x
         float span = (std::abs(rule.paramA) > 0.1f) ? rule.paramA : 2.5f;
         float speed = (std::abs(rule.paramB) > 0.05f) ? rule.paramB : 1.4f;
         float origX = self.transform.position.x;
@@ -252,6 +328,8 @@ void RuntimeSession::ExecuteRuleAction(core::SceneObject& self, const core::Beha
             rule.resourceAmount,
             false,
             nullptr);
+    } else if (rule.actionType == "PlayAudioCue") {
+        TriggerSpatialCueIfConfigured(self, rule.resourceName.empty() ? self.audio.cueType : rule.resourceName);
     }
     self.transform.Sanitize();
 }
@@ -291,6 +369,7 @@ void RuntimeSession::StepSimulation(double deltaSeconds) {
             if (obj.transform.position.y < floorY) {
                 obj.transform.position.y = floorY;
                 if (obj.physics.linearVelocity.y < 0.0f) {
+                    float impactSpeed = std::abs(obj.physics.linearVelocity.y);
                     obj.physics.linearVelocity.y = -obj.physics.linearVelocity.y * std::clamp(obj.physics.restitution, 0.0f, 1.0f);
                     if (std::abs(obj.physics.linearVelocity.y) < 0.15f) {
                         obj.physics.linearVelocity.y = 0.0f;
@@ -299,6 +378,10 @@ void RuntimeSession::StepSimulation(double deltaSeconds) {
                     obj.physics.linearVelocity.x *= damp;
                     obj.physics.linearVelocity.z *= damp;
                     ++metrics_.collisionsResolvedCount;
+
+                    if (impactSpeed > 0.35f && obj.audio.enabled && obj.audio.playOnCollision) {
+                        TriggerSpatialCueIfConfigured(obj, "PhysicsImpact");
+                    }
                 }
             }
             obj.transform.Sanitize();
@@ -308,7 +391,12 @@ void RuntimeSession::StepSimulation(double deltaSeconds) {
     metrics_.elapsedPlayTimeSec += clampedDt;
     ++metrics_.stepCount;
 
+    // Evaluate unified keyframed animation tracks & no-code behavior rules
     for (auto& obj : runtimeObjects_) {
+        if (obj.animation.enabled && !obj.animation.tracks.empty()) {
+            EvaluateObjectAnimationAtTime(obj, metrics_.elapsedPlayTimeSec);
+            ++metrics_.animationsEvaluatedCount;
+        }
         for (const auto& rule : obj.logic.rules) {
             if (rule.triggerType == "OnTick" || rule.triggerType == "OnProximity") {
                 ++metrics_.rulesEvaluatedCount;
@@ -340,6 +428,9 @@ bool RuntimeSession::TriggerInteraction(core::ObjectId objectId, std::string* ou
                 anyTriggered = true;
             }
         }
+    }
+    if (obj->audio.enabled && obj->audio.playOnInteract) {
+        TriggerSpatialCueIfConfigured(*obj);
     }
     std::string msg = "Interaction triggered on " + obj->name + " (" + core::FormatObjectId(objectId) +
                       ") -> state=" + obj->logic.currentState;
@@ -389,6 +480,7 @@ bool RuntimeSession::ExecuteConservedResourceTransfer(
 
     dst->logic.inventory[resourceName] = dstBefore + amount;
     ++metrics_.conservedTransfersSucceeded;
+    TriggerSpatialCueIfConfigured(*dst, "TransferArp");
     AppendTrace("Transferred " + std::to_string(amount) + " " + resourceName +
                 " from " + src->name + " to " + dst->name);
     return true;

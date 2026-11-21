@@ -25,6 +25,8 @@ float NextUniformSymmetric(uint32_t& state) {
     return (static_cast<float>(r & 0x00FFFFFFu) / static_cast<float>(0x00800000u)) - 1.0f;
 }
 
+volatile float gInferenceBenchmarkSink = 0.0f;
+
 } // namespace
 
 nlohmann::json SpecialistTrialReceipt::ToJson() const {
@@ -39,9 +41,14 @@ nlohmann::json SpecialistTrialReceipt::ToJson() const {
         {"finalTrainMse", finalTrainMse},
         {"initialHoldoutMse", initialHoldoutMse},
         {"finalHoldoutMse", finalHoldoutMse},
+        {"baselineHoldoutMse", baselineHoldoutMse},
+        {"mseReductionOverBaselinePct", mseReductionOverBaselinePct},
+        {"holdoutMae", holdoutMae},
+        {"holdoutRSquared", holdoutRSquared},
         {"holdoutAccuracyPct", holdoutAccuracyPct},
         {"trainingDurationMs", trainingDurationMs},
         {"avgInferenceLatencyUs", avgInferenceLatencyUs},
+        {"inferenceTimingPasses", inferenceTimingPasses},
         {"parameterMemoryBytes", parameterMemoryBytes},
         {"convergedAndQualified", convergedAndQualified},
         {"paretoOptimal", paretoOptimal},
@@ -51,6 +58,10 @@ nlohmann::json SpecialistTrialReceipt::ToJson() const {
         {"failureOrRejectionReason", failureOrRejectionReason}
     };
 }
+
+// ============================================================================
+// 1. NativeMaterialSpecialistModel Implementation (12x24x7 MLP)
+// ============================================================================
 
 NativeMaterialSpecialistModel::NativeMaterialSpecialistModel() = default;
 
@@ -173,6 +184,7 @@ SpecialistTrialReceipt NativeMaterialSpecialistModel::TrainAndEvaluate(
     const TrainingHyperparameters& params) {
     SpecialistTrialReceipt receipt{};
     receipt.experimentName = params.experimentName;
+    receipt.modelOrigin = "PLATZ-Native-From-Scratch-MLP-12x24x7";
     receipt.randomSeed = params.randomSeed;
     receipt.trainSampleCount = trainSet.size();
     receipt.holdoutSampleCount = holdoutSet.size();
@@ -192,6 +204,38 @@ SpecialistTrialReceipt NativeMaterialSpecialistModel::TrainAndEvaluate(
     receipt.datasetProvenanceHash = trainHash;
     receipt.holdoutSetHash = holdoutHash;
     lockedHoldoutHash_ = holdoutHash;
+
+    // Deterministic baseline predictor: mean target vector computed strictly from trainSet
+    std::array<float, kOutDim> trainTargetMean{};
+    trainTargetMean.fill(0.0f);
+    for (const auto& s : trainSet) {
+        for (size_t k = 0; k < kOutDim; ++k) trainTargetMean[k] += s.targetPbr[k];
+    }
+    for (size_t k = 0; k < kOutDim; ++k) {
+        trainTargetMean[k] /= static_cast<float>(trainSet.size());
+    }
+
+    float baselineSqErr = 0.0f;
+    std::array<float, kOutDim> holdoutTargetMean{};
+    holdoutTargetMean.fill(0.0f);
+    for (const auto& s : holdoutSet) {
+        for (size_t k = 0; k < kOutDim; ++k) {
+            float d = trainTargetMean[k] - s.targetPbr[k];
+            baselineSqErr += d * d;
+            holdoutTargetMean[k] += s.targetPbr[k];
+        }
+    }
+    for (size_t k = 0; k < kOutDim; ++k) {
+        holdoutTargetMean[k] /= static_cast<float>(holdoutSet.size());
+    }
+    float holdoutTotalVar = 0.0f;
+    for (const auto& s : holdoutSet) {
+        for (size_t k = 0; k < kOutDim; ++k) {
+            float d = s.targetPbr[k] - holdoutTargetMean[k];
+            holdoutTotalVar += d * d;
+        }
+    }
+    receipt.baselineHoldoutMse = baselineSqErr / static_cast<float>(holdoutSet.size() * kOutDim);
 
     auto prevW1 = w1_;
     auto prevB1 = b1_;
@@ -220,7 +264,7 @@ SpecialistTrialReceipt NativeMaterialSpecialistModel::TrainAndEvaluate(
         return totalLoss / static_cast<float>(split.size() * kOutDim);
     };
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
 
     receipt.initialTrainMse = computeMse(trainSet);
     receipt.initialHoldoutMse = computeMse(holdoutSet);
@@ -293,38 +337,66 @@ SpecialistTrialReceipt NativeMaterialSpecialistModel::TrainAndEvaluate(
         ++receipt.epochsRun;
     }
 
-    auto t1 = std::chrono::high_resolution_clock::now();
+    auto t1 = std::chrono::steady_clock::now();
     receipt.trainingDurationMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     receipt.finalTrainMse = computeMse(trainSet);
     receipt.finalHoldoutMse = computeMse(holdoutSet);
 
-    auto infT0 = std::chrono::high_resolution_clock::now();
+    // Compute held-out accuracy, MAE, and R^2 directly from real Forward() predictions
     size_t accurateOutputs = 0;
     size_t totalOutputs = holdoutSet.size() * kOutDim;
+    float sumAbsErr = 0.0f;
+    float sumSqErr = 0.0f;
     for (const auto& s : holdoutSet) {
         auto pred = Forward(s.features);
         for (size_t k = 0; k < kOutDim; ++k) {
-            if (std::abs(pred[k] - s.targetPbr[k]) < 0.12f) {
+            float diff = pred[k] - s.targetPbr[k];
+            float absDiff = std::abs(diff);
+            sumAbsErr += absDiff;
+            sumSqErr += diff * diff;
+            if (absDiff < 0.12f) {
                 ++accurateOutputs;
             }
         }
     }
-    auto infT1 = std::chrono::high_resolution_clock::now();
-    double totalInfUs = std::chrono::duration<double, std::micro>(infT1 - infT0).count();
-    receipt.avgInferenceLatencyUs = holdoutSet.empty() ? 0.0 : (totalInfUs / static_cast<double>(holdoutSet.size()));
+    receipt.holdoutMae = (totalOutputs > 0) ? (sumAbsErr / static_cast<float>(totalOutputs)) : 0.0f;
+    receipt.holdoutRSquared = (holdoutTotalVar > 1e-8f) ? (1.0f - (sumSqErr / holdoutTotalVar)) : 0.0f;
     receipt.holdoutAccuracyPct = (totalOutputs > 0)
         ? (100.0f * static_cast<float>(accurateOutputs) / static_cast<float>(totalOutputs))
         : 0.0f;
+    receipt.mseReductionOverBaselinePct = (receipt.baselineHoldoutMse > 1e-8f)
+        ? (100.0f * (1.0f - (receipt.finalHoldoutMse / receipt.baselineHoldoutMse)))
+        : 0.0f;
+
+    // Real multi-pass timed inference benchmark (1,000 sweeps across holdoutSet) to avoid sub-microsecond clock quantization
+    constexpr uint32_t kTimingRepeats = 1000u;
+    float accum = 0.0f;
+    auto infT0 = std::chrono::steady_clock::now();
+    for (uint32_t rep = 0; rep < kTimingRepeats; ++rep) {
+        for (const auto& s : holdoutSet) {
+            auto pred = Forward(s.features);
+            accum += pred[0];
+        }
+    }
+    auto infT1 = std::chrono::steady_clock::now();
+    gInferenceBenchmarkSink = accum;
+    receipt.inferenceTimingPasses = static_cast<uint32_t>(holdoutSet.size()) * kTimingRepeats;
+    double totalInfUs = std::chrono::duration<double, std::micro>(infT1 - infT0).count();
+    receipt.avgInferenceLatencyUs = (receipt.inferenceTimingPasses > 0)
+        ? (totalInfUs / static_cast<double>(receipt.inferenceTimingPasses))
+        : 0.0;
 
     bool improved = (receipt.finalHoldoutMse < receipt.initialHoldoutMse * 0.35f) &&
+                    (receipt.finalHoldoutMse < receipt.baselineHoldoutMse * 0.35f) &&
                     (receipt.holdoutAccuracyPct >= 80.0f);
 
     if (!improved) {
         receipt.convergedAndQualified = false;
         receipt.qualificationStatus = "FAILED_CONVERGENCE_GATE";
         receipt.failureOrRejectionReason = "Candidate holdout MSE (" + std::to_string(receipt.finalHoldoutMse) +
-                                           ") did not meet promotion threshold; recorded in negative result memory (PLZ-AIX-012)";
+                                           ") or accuracy (" + std::to_string(receipt.holdoutAccuracyPct) +
+                                           "%) did not meet promotion threshold; recorded in negative result memory (PLZ-AIX-012)";
         if (hadPreviousTrained) {
             w1_ = prevW1; b1_ = prevB1; w2_ = prevW2; b2_ = prevB2;
         }
@@ -333,7 +405,8 @@ SpecialistTrialReceipt NativeMaterialSpecialistModel::TrainAndEvaluate(
     }
 
     receipt.convergedAndQualified = true;
-    receipt.paretoOptimal = (!hadPreviousTrained) || (receipt.finalHoldoutMse <= activeReceipt_.finalHoldoutMse);
+    receipt.paretoOptimal = (receipt.finalHoldoutMse < receipt.baselineHoldoutMse) &&
+                            ((!hadPreviousTrained) || (receipt.finalHoldoutMse <= activeReceipt_.finalHoldoutMse));
     receipt.qualificationStatus = "VERIFIED_CANDIDATE";
     trained_ = true;
     activeReceipt_ = receipt;
@@ -397,21 +470,12 @@ bool NativeMaterialSpecialistModel::AttemptUnauthorizedSelfPromotionOrHoldoutEdi
 
 NativeGameplayBalanceSpecialistModel::NativeGameplayBalanceSpecialistModel() = default;
 
-SpecialistTrialReceipt NativeGameplayBalanceSpecialistModel::TrainDefaultGameplaySpecialist(uint32_t seed) {
-    SpecialistTrialReceipt rec{};
-    rec.experimentName = "platz_gameplay_balance_specialist_v1";
-    rec.modelOrigin = "PLATZ-Native-From-Scratch-MLP-10x20x5";
-    rec.randomSeed = seed;
-    rec.epochsRun = 140;
-    rec.trainSampleCount = 24;
-    rec.holdoutSampleCount = 8;
-    rec.parameterMemoryBytes = (w1_.size() + b1_.size() + w2_.size() + b2_.size()) * sizeof(float);
+void NativeGameplayBalanceSpecialistModel::BuildDefaultGameplayDataset(
+    std::vector<GameplayTrainingSample>* outTrainSet,
+    std::vector<GameplayTrainingSample>* outHoldoutSet) {
+    if (outTrainSet) outTrainSet->clear();
+    if (outHoldoutSet) outHoldoutSet->clear();
 
-    struct GpSample {
-        std::array<float, 10> feat;
-        std::array<float, 5> target;
-    };
-    std::vector<GpSample> trainSet, holdoutSet;
     const std::array<float, 5> genreTargets[4] = {
         {0.40f, 0.65f, 0.30f, 0.55f, 0.60f}, // 0: Arcade Platformer / Kinetic
         {0.75f, 0.25f, 0.70f, 0.35f, 0.30f}, // 1: Heavy Tactical / Mech
@@ -421,24 +485,161 @@ SpecialistTrialReceipt NativeGameplayBalanceSpecialistModel::TrainDefaultGamepla
 
     for (int g = 0; g < 4; ++g) {
         for (int v = 0; v < 8; ++v) {
-            float diff = 0.1f + 0.11f * static_cast<float>(v);
-            GpSample s{};
-            s.feat.fill(0.0f);
-            s.feat[g] = 1.0f;
-            s.feat[4] = diff;
-            s.feat[5] = 1.0f - diff;
-            s.feat[6] = 0.5f;
-            s.feat[7] = (g == 2) ? 0.9f : 0.3f;
-            s.feat[8] = 0.6f;
-            s.feat[9] = 1.0f;
-            s.target = genreTargets[g];
-            s.target[4] = std::clamp(s.target[4] + (diff - 0.5f) * 0.2f, 0.1f, 0.95f);
-            if (v >= 6) holdoutSet.push_back(s);
-            else trainSet.push_back(s);
+            float diff = 0.10f + 0.11f * static_cast<float>(v);
+            GameplayTrainingSample s{};
+            s.sampleId = "platz_gp_genre" + std::to_string(g) + "_v" + std::to_string(v);
+            s.features.fill(0.0f);
+            s.features[g] = 1.0f;
+            s.features[4] = diff;
+            s.features[5] = 1.0f - diff;
+            s.features[6] = 0.5f;
+            s.features[7] = (g == 2) ? 0.9f : 0.3f;
+            s.features[8] = 0.6f;
+            s.features[9] = 1.0f;
+
+            s.targetBalance = genreTargets[g];
+            s.targetBalance[4] = std::clamp(s.targetBalance[4] + (diff - 0.5f) * 0.20f, 0.10f, 0.95f);
+            s.sourceLicense = "PLATZ-Internal";
+            s.trainingConsentGranted = true;
+            s.isRestrictedPrivate = false;
+
+            if (v >= 6) {
+                if (outHoldoutSet) outHoldoutSet->push_back(s);
+            } else {
+                if (outTrainSet) outTrainSet->push_back(s);
+            }
         }
     }
+}
 
-    uint32_t rng = seed;
+bool NativeGameplayBalanceSpecialistModel::ValidateDatasetProvenanceAndConsent(
+    const std::vector<GameplayTrainingSample>& dataset,
+    std::string* outDatasetHash,
+    std::string* outViolationReason) {
+    if (dataset.empty()) {
+        if (outViolationReason) *outViolationReason = "Gameplay dataset is empty";
+        return false;
+    }
+
+    std::ostringstream canonicalStream;
+    for (const auto& s : dataset) {
+        if (s.isRestrictedPrivate) {
+            if (outViolationReason) {
+                *outViolationReason = "Gameplay dataset contains restricted private sample '" + s.sampleId +
+                                      "' (blocked by PLZ-TRUST-004 / PLZ-SAFEX-005 / N-22)";
+            }
+            return false;
+        }
+        if (!s.trainingConsentGranted) {
+            if (outViolationReason) {
+                *outViolationReason = "Gameplay sample '" + s.sampleId + "' lacks trainingConsentGranted (N-22)";
+            }
+            return false;
+        }
+        if (s.sourceLicense.empty() || s.sourceLicense == "UNLICENSED" || s.sourceLicense == "UNKNOWN") {
+            if (outViolationReason) {
+                *outViolationReason = "Gameplay sample '" + s.sampleId + "' has invalid license '" + s.sourceLicense + "'";
+            }
+            return false;
+        }
+
+        canonicalStream << s.sampleId << ":" << s.sourceLicense << ":";
+        for (float f : s.features) canonicalStream << f << ",";
+        for (float t : s.targetBalance) canonicalStream << t << ",";
+        canonicalStream << ";";
+    }
+
+    if (outDatasetHash) {
+        *outDatasetHash = platform::ComputeSha256Hex(canonicalStream.str());
+    }
+    return true;
+}
+
+std::array<float, 5> NativeGameplayBalanceSpecialistModel::Forward(const std::array<float, 10>& input) const {
+    std::array<float, kHiddenDim> h{};
+    for (size_t j = 0; j < kHiddenDim; ++j) {
+        float sum = b1_[j];
+        for (size_t i = 0; i < kInDim; ++i) {
+            sum += input[i] * w1_[i * kHiddenDim + j];
+        }
+        h[j] = (sum > 0.0f) ? sum : (0.05f * sum);
+    }
+    std::array<float, kOutDim> out{};
+    for (size_t k = 0; k < kOutDim; ++k) {
+        float sum = b2_[k];
+        for (size_t j = 0; j < kHiddenDim; ++j) {
+            sum += h[j] * w2_[j * kOutDim + k];
+        }
+        out[k] = Sigmoid(sum);
+    }
+    return out;
+}
+
+SpecialistTrialReceipt NativeGameplayBalanceSpecialistModel::TrainAndEvaluate(
+    const std::vector<GameplayTrainingSample>& trainSet,
+    const std::vector<GameplayTrainingSample>& holdoutSet,
+    const TrainingHyperparameters& params) {
+    SpecialistTrialReceipt rec{};
+    rec.experimentName = params.experimentName;
+    rec.modelOrigin = "PLATZ-Native-From-Scratch-MLP-10x20x5";
+    rec.randomSeed = params.randomSeed;
+    rec.trainSampleCount = trainSet.size();
+    rec.holdoutSampleCount = holdoutSet.size();
+    rec.parameterMemoryBytes = (w1_.size() + b1_.size() + w2_.size() + b2_.size()) * sizeof(float);
+
+    std::string trainHash, holdoutHash, violation;
+    if (!ValidateDatasetProvenanceAndConsent(trainSet, &trainHash, &violation) ||
+        !ValidateDatasetProvenanceAndConsent(holdoutSet, &holdoutHash, &violation)) {
+        rec.convergedAndQualified = false;
+        rec.qualificationStatus = "REJECTED_PROVENANCE_OR_PRIVACY";
+        rec.failureOrRejectionReason = violation;
+        failedTrialMemory_.push_back(rec);
+        return rec;
+    }
+
+    rec.datasetProvenanceHash = trainHash;
+    rec.holdoutSetHash = holdoutHash;
+    lockedHoldoutHash_ = holdoutHash;
+
+    // Deterministic baseline predictor: mean target vector computed strictly from trainSet
+    std::array<float, kOutDim> trainTargetMean{};
+    trainTargetMean.fill(0.0f);
+    for (const auto& s : trainSet) {
+        for (size_t k = 0; k < kOutDim; ++k) trainTargetMean[k] += s.targetBalance[k];
+    }
+    for (size_t k = 0; k < kOutDim; ++k) {
+        trainTargetMean[k] /= static_cast<float>(trainSet.size());
+    }
+
+    float baselineSqErr = 0.0f;
+    std::array<float, kOutDim> holdoutTargetMean{};
+    holdoutTargetMean.fill(0.0f);
+    for (const auto& s : holdoutSet) {
+        for (size_t k = 0; k < kOutDim; ++k) {
+            float d = trainTargetMean[k] - s.targetBalance[k];
+            baselineSqErr += d * d;
+            holdoutTargetMean[k] += s.targetBalance[k];
+        }
+    }
+    for (size_t k = 0; k < kOutDim; ++k) {
+        holdoutTargetMean[k] /= static_cast<float>(holdoutSet.size());
+    }
+    float holdoutTotalVar = 0.0f;
+    for (const auto& s : holdoutSet) {
+        for (size_t k = 0; k < kOutDim; ++k) {
+            float d = s.targetBalance[k] - holdoutTargetMean[k];
+            holdoutTotalVar += d * d;
+        }
+    }
+    rec.baselineHoldoutMse = baselineSqErr / static_cast<float>(holdoutSet.size() * kOutDim);
+
+    auto prevW1 = w1_;
+    auto prevB1 = b1_;
+    auto prevW2 = w2_;
+    auto prevB2 = b2_;
+    bool hadPreviousTrained = trained_;
+
+    uint32_t rng = params.randomSeed;
     float sc1 = std::sqrt(6.0f / static_cast<float>(kInDim + kHiddenDim));
     float sc2 = std::sqrt(6.0f / static_cast<float>(kHiddenDim + kOutDim));
     for (float& w : w1_) w = NextUniformSymmetric(rng) * sc1;
@@ -446,45 +647,41 @@ SpecialistTrialReceipt NativeGameplayBalanceSpecialistModel::TrainDefaultGamepla
     for (float& w : w2_) w = NextUniformSymmetric(rng) * sc2;
     for (float& b : b2_) b = 0.0f;
 
-    auto forward = [&](const std::array<float, 10>& in) {
-        std::array<float, kHiddenDim> h{};
-        for (size_t j = 0; j < kHiddenDim; ++j) {
-            float sum = b1_[j];
-            for (size_t i = 0; i < kInDim; ++i) sum += in[i] * w1_[i * kHiddenDim + j];
-            h[j] = (sum > 0.0f) ? sum : (0.05f * sum);
-        }
-        std::array<float, kOutDim> out{};
-        for (size_t k = 0; k < kOutDim; ++k) {
-            float sum = b2_[k];
-            for (size_t j = 0; j < kHiddenDim; ++j) sum += h[j] * w2_[j * kOutDim + k];
-            out[k] = Sigmoid(sum);
-        }
-        return out;
-    };
-
-    auto evalMse = [&](const std::vector<GpSample>& split) {
+    auto evalMse = [&](const std::vector<GameplayTrainingSample>& split) -> float {
+        if (split.empty()) return 0.0f;
         float loss = 0.0f;
         for (const auto& s : split) {
-            auto p = forward(s.feat);
+            auto p = Forward(s.features);
             for (size_t k = 0; k < kOutDim; ++k) {
-                float d = p[k] - s.target[k];
+                float d = p[k] - s.targetBalance[k];
                 loss += d * d;
             }
         }
         return loss / static_cast<float>(split.size() * kOutDim);
     };
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
     rec.initialTrainMse = evalMse(trainSet);
     rec.initialHoldoutMse = evalMse(holdoutSet);
 
-    float lr = 0.09f;
-    for (uint32_t ep = 0; ep < rec.epochsRun; ++ep) {
+    if (!std::isfinite(params.learningRate) || params.learningRate <= 0.0f || params.learningRate > 5.0f) {
+        rec.convergedAndQualified = false;
+        rec.qualificationStatus = "FAILED_HYPERPARAMETER_BOUNDS";
+        rec.failureOrRejectionReason = "Gameplay learning rate out of stable bounds; recorded in negative result memory (PLZ-AIX-012)";
+        if (hadPreviousTrained) {
+            w1_ = prevW1; b1_ = prevB1; w2_ = prevW2; b2_ = prevB2;
+        }
+        failedTrialMemory_.push_back(rec);
+        return rec;
+    }
+
+    float lr = params.learningRate;
+    for (uint32_t ep = 0; ep < params.epochs; ++ep) {
         for (const auto& s : trainSet) {
             std::array<float, kHiddenDim> z1{}, h{};
             for (size_t j = 0; j < kHiddenDim; ++j) {
                 float sum = b1_[j];
-                for (size_t i = 0; i < kInDim; ++i) sum += s.feat[i] * w1_[i * kHiddenDim + j];
+                for (size_t i = 0; i < kInDim; ++i) sum += s.features[i] * w1_[i * kHiddenDim + j];
                 z1[j] = sum;
                 h[j] = (sum > 0.0f) ? sum : (0.05f * sum);
             }
@@ -493,7 +690,7 @@ SpecialistTrialReceipt NativeGameplayBalanceSpecialistModel::TrainDefaultGamepla
                 float sum = b2_[k];
                 for (size_t j = 0; j < kHiddenDim; ++j) sum += h[j] * w2_[j * kOutDim + k];
                 float pred = Sigmoid(sum);
-                dOut[k] = (pred - s.target[k]) * pred * (1.0f - pred);
+                dOut[k] = (pred - s.targetBalance[k]) * pred * (1.0f - pred);
             }
             std::array<float, kHiddenDim> dH{};
             for (size_t j = 0; j < kHiddenDim; ++j) {
@@ -507,26 +704,98 @@ SpecialistTrialReceipt NativeGameplayBalanceSpecialistModel::TrainDefaultGamepla
             for (size_t k = 0; k < kOutDim; ++k) b2_[k] -= lr * dOut[k];
             for (size_t i = 0; i < kInDim; ++i)
                 for (size_t j = 0; j < kHiddenDim; ++j)
-                    w1_[i * kHiddenDim + j] -= lr * s.feat[i] * dH[j];
+                    w1_[i * kHiddenDim + j] -= lr * s.features[i] * dH[j];
             for (size_t j = 0; j < kHiddenDim; ++j) b1_[j] -= lr * dH[j];
         }
+        ++rec.epochsRun;
     }
 
-    auto t1 = std::chrono::high_resolution_clock::now();
+    auto t1 = std::chrono::steady_clock::now();
     rec.trainingDurationMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
     rec.finalTrainMse = evalMse(trainSet);
     rec.finalHoldoutMse = evalMse(holdoutSet);
-    rec.holdoutAccuracyPct = 100.0f;
-    rec.avgInferenceLatencyUs = 0.09;
-    rec.datasetProvenanceHash = platform::ComputeSha256Hex("platz_gameplay_dataset_v1");
-    rec.holdoutSetHash = platform::ComputeSha256Hex("platz_gameplay_holdout_v1");
-    rec.convergedAndQualified = (rec.finalHoldoutMse < rec.initialHoldoutMse * 0.25f);
-    rec.paretoOptimal = true;
+
+    // Real held-out evaluation from actual Forward() predictions (NEVER hardcoded)
+    size_t accurateOutputs = 0;
+    size_t totalOutputs = holdoutSet.size() * kOutDim;
+    float sumAbsErr = 0.0f;
+    float sumSqErr = 0.0f;
+    for (const auto& s : holdoutSet) {
+        auto pred = Forward(s.features);
+        for (size_t k = 0; k < kOutDim; ++k) {
+            float diff = pred[k] - s.targetBalance[k];
+            float absDiff = std::abs(diff);
+            sumAbsErr += absDiff;
+            sumSqErr += diff * diff;
+            if (absDiff < 0.12f) {
+                ++accurateOutputs;
+            }
+        }
+    }
+    rec.holdoutMae = (totalOutputs > 0) ? (sumAbsErr / static_cast<float>(totalOutputs)) : 0.0f;
+    rec.holdoutRSquared = (holdoutTotalVar > 1e-8f) ? (1.0f - (sumSqErr / holdoutTotalVar)) : 0.0f;
+    rec.holdoutAccuracyPct = (totalOutputs > 0)
+        ? (100.0f * static_cast<float>(accurateOutputs) / static_cast<float>(totalOutputs))
+        : 0.0f;
+    rec.mseReductionOverBaselinePct = (rec.baselineHoldoutMse > 1e-8f)
+        ? (100.0f * (1.0f - (rec.finalHoldoutMse / rec.baselineHoldoutMse)))
+        : 0.0f;
+
+    // Real multi-pass timed inference latency benchmark
+    constexpr uint32_t kTimingRepeats = 1000u;
+    float accum = 0.0f;
+    auto infT0 = std::chrono::steady_clock::now();
+    for (uint32_t rep = 0; rep < kTimingRepeats; ++rep) {
+        for (const auto& s : holdoutSet) {
+            auto pred = Forward(s.features);
+            accum += pred[0];
+        }
+    }
+    auto infT1 = std::chrono::steady_clock::now();
+    gInferenceBenchmarkSink = accum;
+    rec.inferenceTimingPasses = static_cast<uint32_t>(holdoutSet.size()) * kTimingRepeats;
+    double totalInfUs = std::chrono::duration<double, std::micro>(infT1 - infT0).count();
+    rec.avgInferenceLatencyUs = (rec.inferenceTimingPasses > 0)
+        ? (totalInfUs / static_cast<double>(rec.inferenceTimingPasses))
+        : 0.0;
+
+    bool improved = (rec.finalHoldoutMse < rec.initialHoldoutMse * 0.35f) &&
+                    (rec.finalHoldoutMse < rec.baselineHoldoutMse * 0.35f) &&
+                    (rec.holdoutAccuracyPct >= 80.0f);
+
+    if (!improved) {
+        rec.convergedAndQualified = false;
+        rec.qualificationStatus = "FAILED_CONVERGENCE_GATE";
+        rec.failureOrRejectionReason = "Gameplay specialist holdout MSE (" + std::to_string(rec.finalHoldoutMse) +
+                                       ") or accuracy (" + std::to_string(rec.holdoutAccuracyPct) +
+                                       "%) did not meet qualification threshold; stored in negative result memory (PLZ-AIX-012)";
+        if (hadPreviousTrained) {
+            w1_ = prevW1; b1_ = prevB1; w2_ = prevW2; b2_ = prevB2;
+        }
+        failedTrialMemory_.push_back(rec);
+        return rec;
+    }
+
+    rec.convergedAndQualified = true;
+    rec.paretoOptimal = (rec.finalHoldoutMse < rec.baselineHoldoutMse) &&
+                        ((!hadPreviousTrained) || (rec.finalHoldoutMse <= activeReceipt_.finalHoldoutMse));
     rec.qualificationStatus = "VERIFIED_CANDIDATE";
 
     trained_ = true;
     activeReceipt_ = rec;
+    trialHistory_.push_back(rec);
     return rec;
+}
+
+SpecialistTrialReceipt NativeGameplayBalanceSpecialistModel::TrainDefaultGameplaySpecialist(uint32_t seed) {
+    std::vector<GameplayTrainingSample> trainSet, holdoutSet;
+    BuildDefaultGameplayDataset(&trainSet, &holdoutSet);
+    TrainingHyperparameters hp;
+    hp.experimentName = "platz_gameplay_balance_specialist_v1";
+    hp.epochs = 160;
+    hp.learningRate = 0.09f;
+    hp.randomSeed = seed;
+    return TrainAndEvaluate(trainSet, holdoutSet, hp);
 }
 
 GameplayBalancePrediction NativeGameplayBalanceSpecialistModel::PredictForGenreIndex(
@@ -543,18 +812,7 @@ GameplayBalancePrediction NativeGameplayBalanceSpecialistModel::PredictForGenreI
     in[8] = 0.6f;
     in[9] = 1.0f;
 
-    std::array<float, kHiddenDim> h{};
-    for (size_t j = 0; j < kHiddenDim; ++j) {
-        float sum = b1_[j];
-        for (size_t i = 0; i < kInDim; ++i) sum += in[i] * w1_[i * kHiddenDim + j];
-        h[j] = (sum > 0.0f) ? sum : (0.05f * sum);
-    }
-    std::array<float, kOutDim> out{};
-    for (size_t k = 0; k < kOutDim; ++k) {
-        float sum = b2_[k];
-        for (size_t j = 0; j < kHiddenDim; ++j) sum += h[j] * w2_[j * kOutDim + k];
-        out[k] = Sigmoid(sum);
-    }
+    auto out = Forward(in);
 
     GameplayBalancePrediction pred;
     pred.mass = 0.5f + out[0] * 4.5f;
@@ -562,8 +820,33 @@ GameplayBalancePrediction NativeGameplayBalanceSpecialistModel::PredictForGenreI
     pred.friction = std::clamp(out[2], 0.05f, 0.95f);
     pred.patrolSpan = 1.0f + out[3] * 4.0f;
     pred.patrolSpeed = 0.5f + out[4] * 3.0f;
-    pred.modelProvenance = activeReceipt_.modelOrigin + " (seed=" + std::to_string(activeReceipt_.randomSeed) + ")";
+    pred.modelProvenance = activeReceipt_.modelOrigin + " (seed=" +
+                           std::to_string(activeReceipt_.randomSeed) +
+                           ", holdoutHash=" + activeReceipt_.holdoutSetHash.substr(0, 12) + ")";
     return pred;
+}
+
+bool NativeGameplayBalanceSpecialistModel::AttemptUnauthorizedSelfPromotionOrHoldoutEdit(
+    const std::string& requestedStatus,
+    bool attemptModifyHoldout,
+    std::string* outSecurityDenialReason) {
+    if (attemptModifyHoldout) {
+        if (outSecurityDenialReason) {
+            *outSecurityDenialReason =
+                "Security violation blocked (PLZ-SAFEX-011 / N-23): gameplay model attempted to modify protected holdout set (locked SHA-256: " +
+                lockedHoldoutHash_ + ")";
+        }
+        return false;
+    }
+    if (requestedStatus == "INDEPENDENTLY_ACCEPTED" || requestedStatus == "PRODUCTION_APPROVED_BY_SELF") {
+        if (outSecurityDenialReason) {
+            *outSecurityDenialReason =
+                "Security violation blocked (PLZ-OPS-016 / PLZ-SAFEX-011 / N-23): gameplay model cannot self-promote to '" +
+                requestedStatus + "'.";
+        }
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================

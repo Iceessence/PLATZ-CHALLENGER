@@ -70,7 +70,37 @@ TEST_CASE("Vulkan 1.4 Renderer, Slang SPIR-V Validation, GPU Readback, Picking, 
     REQUIRE(renderer.ReadbackPickedObjectIdAtPixel(320, 180, &gpuPickedId, &err));
     CHECK(gpuPickedId == targetId);
 
-    // 2. N-04: Corrupt / clear derived GPU mesh caches and verify automatic rebuild from canonical blobs
+    // 2. Verify O(1) steady-state GPU resource sync fast-path when project has no mutations
+    uint64_t skipsBefore = renderer.GetPerfMetrics().gpuSyncSkipsCount;
+    REQUIRE(renderer.RenderSceneOffscreen(project, project.GetObjects(), camera, targetId, &err));
+    CHECK(renderer.GetPerfMetrics().gpuSyncSkipsCount > skipsBefore);
+
+    // 2b. Verify ST-07 5-node DAG Slang compilation hot-reloads cleanly into the live Vulkan 1.4 pipeline!
+    for (const auto& o : project.GetObjects()) {
+        if (o.logic.stationCategory == "ST-07" && !o.material.materialGraphJson.empty()) {
+            auto dag = creative::MaterialGraphDocument::FromJsonString(o.material.materialGraphJson);
+            std::string dagSlang;
+            REQUIRE(dag.CompileToSlangShaderSource(&dagSlang));
+            std::string dagDiag;
+            CHECK(renderer.HotReloadPbrShaderFromSlangSource(dagSlang, &dagDiag));
+            break;
+        }
+    }
+
+    // 2c. Focus ST-08 (Pixel-Exact PLZT custom texture bound on 3D Patrol Drone) and verify live textured render
+    for (const auto& o : project.GetObjects()) {
+        if (o.logic.stationCategory == "ST-08") {
+            CHECK(o.material.albedoTextureAssetId != 0);
+            camera.FocusOnPoint(o.transform.position, 2.8f);
+            REQUIRE(renderer.RenderSceneOffscreen(project, project.GetObjects(), camera, o.id, &err));
+            core::ObjectId pickedDrone = 0;
+            REQUIRE(renderer.ReadbackPickedObjectIdAtPixel(320, 180, &pickedDrone, &err));
+            CHECK(pickedDrone == o.id);
+            break;
+        }
+    }
+
+    // 3. N-04: Corrupt / clear derived GPU mesh & texture caches and verify automatic rebuild from canonical blobs
     uint32_t rebuildsBefore = renderer.GetPerfMetrics().rebuiltCacheCount;
     renderer.InvalidateDerivedGpuCaches();
     REQUIRE(renderer.RenderSceneOffscreen(project, project.GetObjects(), camera, targetId, &err));

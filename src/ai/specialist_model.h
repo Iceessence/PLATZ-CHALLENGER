@@ -27,6 +27,15 @@ struct TrainingSample {
     bool isRestrictedPrivate{false}; // Must be rejected if true (PLZ-TRUST-004, PLZ-SAFEX-005, N-22)
 };
 
+struct GameplayTrainingSample {
+    std::string sampleId;
+    std::array<float, 10> features{};
+    std::array<float, 5> targetBalance{};
+    std::string sourceLicense{"PLATZ-Internal"};
+    bool trainingConsentGranted{true};
+    bool isRestrictedPrivate{false}; // Must be rejected if true (PLZ-TRUST-004, PLZ-SAFEX-005, N-22)
+};
+
 struct TrainingHyperparameters {
     std::string experimentName{"platz_pbr_specialist_v1"};
     uint32_t epochs{160};
@@ -45,9 +54,14 @@ struct SpecialistTrialReceipt {
     float finalTrainMse{0.0f};
     float initialHoldoutMse{0.0f};
     float finalHoldoutMse{0.0f};
-    float holdoutAccuracyPct{0.0f};
+    float baselineHoldoutMse{0.0f};          // Deterministic mean-target baseline evaluated on identical holdout split
+    float mseReductionOverBaselinePct{0.0f}; // Measured percentage MSE reduction over baseline
+    float holdoutMae{0.0f};                  // Measured held-out Mean Absolute Error
+    float holdoutRSquared{0.0f};             // Measured held-out coefficient of determination (R^2)
+    float holdoutAccuracyPct{0.0f};          // Measured held-out fraction of outputs within tolerance (|pred-target| < 0.12)
     double trainingDurationMs{0.0};
-    double avgInferenceLatencyUs{0.0};
+    double avgInferenceLatencyUs{0.0};       // Measured via multi-pass high-res timer over actual Forward() calls
+    uint32_t inferenceTimingPasses{0};       // Total forward passes averaged for avgInferenceLatencyUs
     uint64_t parameterMemoryBytes{0};
     bool convergedAndQualified{false};
     bool paretoOptimal{false};
@@ -134,11 +148,34 @@ class NativeGameplayBalanceSpecialistModel {
 public:
     NativeGameplayBalanceSpecialistModel();
 
+    static void BuildDefaultGameplayDataset(
+        std::vector<GameplayTrainingSample>* outTrainSet,
+        std::vector<GameplayTrainingSample>* outHoldoutSet);
+
+    static bool ValidateDatasetProvenanceAndConsent(
+        const std::vector<GameplayTrainingSample>& dataset,
+        std::string* outDatasetHash,
+        std::string* outViolationReason);
+
+    SpecialistTrialReceipt TrainAndEvaluate(
+        const std::vector<GameplayTrainingSample>& trainSet,
+        const std::vector<GameplayTrainingSample>& holdoutSet,
+        const TrainingHyperparameters& params);
+
     SpecialistTrialReceipt TrainDefaultGameplaySpecialist(uint32_t seed = 20261122u);
+
+    std::array<float, 5> Forward(const std::array<float, 10>& input) const;
     GameplayBalancePrediction PredictForGenreIndex(int genreIndex, float difficultyScale = 0.5f) const;
+
+    bool AttemptUnauthorizedSelfPromotionOrHoldoutEdit(
+        const std::string& requestedStatus,
+        bool attemptModifyHoldout,
+        std::string* outSecurityDenialReason);
 
     bool IsTrained() const { return trained_; }
     const SpecialistTrialReceipt& GetActiveReceipt() const { return activeReceipt_; }
+    const std::vector<SpecialistTrialReceipt>& GetTrialHistory() const { return trialHistory_; }
+    const std::vector<SpecialistTrialReceipt>& GetNegativeResultMemory() const { return failedTrialMemory_; }
 
 private:
     static constexpr size_t kInDim = 10;
@@ -151,7 +188,10 @@ private:
     std::array<float, kOutDim> b2_{};
 
     bool trained_{false};
+    std::string lockedHoldoutHash_;
     SpecialistTrialReceipt activeReceipt_{};
+    std::vector<SpecialistTrialReceipt> trialHistory_;
+    std::vector<SpecialistTrialReceipt> failedTrialMemory_;
 };
 
 // ============================================================================

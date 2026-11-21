@@ -191,31 +191,62 @@ TEST_CASE("Gate 4: Non-Destructive 3D Modifier Stack, Visual Material Node Graph
     CHECK(quality.valid);
     CHECK(quality.triangleCount == (baseCube.indices.size() / 3) * 4);
 
-    // 2. Visual Material Node Graph Validation & Slang Compilation (PLZ-MAT-001, PLZ-RENDERX-002)
+    // 2. Expandable Validated DAG Visual Material Node Graph -> Slang Compilation (PLZ-MAT-001, PLZ-RENDERX-002)
     creative::MaterialGraphDocument graph;
+    CHECK(graph.ValidateGraph().valid);
+
+    // Expand beyond default 4 nodes with WaveBands + BlendMix (2-input DAG!)
+    std::string waveId = graph.AddNode("WaveBands", {0.10f, 0.92f, 0.98f}, 7.0f, 0.30f, "node_albedo");
+    std::string blendId = graph.AddNode("BlendMix", {1.0f, 1.0f, 1.0f}, 0.50f, 0.0f, waveId, "node_checker");
+    REQUIRE(graph.ConnectNodes(blendId, "node_fresnel", 0));
+    auto expVal = graph.ValidateGraph();
+    CHECK(expVal.valid);
+    CHECK(graph.GetNodes().size() == 6);
+    CHECK(expVal.topologicalOrder.size() == 6);
+
+    // Attempt to introduce a cycle (node_fresnel -> waveId) via ConnectNodes: must be rejected and rolled back cleanly!
+    std::string cycleErr;
+    CHECK_FALSE(graph.ConnectNodes("node_fresnel", waveId, 0, &cycleErr));
+    CHECK((cycleErr.find("ycle") != std::string::npos || cycleErr.find("DAG") != std::string::npos));
     CHECK(graph.ValidateGraph().valid);
 
     std::string slangCode, failNode, err;
     CHECK(graph.CompileToSlangShaderSource(&slangCode, &failNode, &err));
     CHECK(slangCode.find("DistributionGGX") != std::string::npos);
-    CHECK(slangCode.find("graphFresnel") != std::string::npos);
+    CHECK(slangCode.find("sin(") != std::string::npos);
+    CHECK(slangCode.find("lerp(") != std::string::npos);
 
-    // Introduce a broken node link and verify PLZ-RENDERX-002 reports the exact failing node ID
+    // Remove a node and verify downstream rewiring preserves DAG validity
+    CHECK(graph.RemoveNode(waveId));
+    CHECK(graph.ValidateGraph().valid);
+
+    // Introduce a broken node link directly and verify PLZ-RENDERX-002 reports the exact failing node ID
     graph.FindNode("node_fresnel")->inputNodeA = "nonexistent_node_99";
     auto badVal = graph.ValidateGraph();
     CHECK_FALSE(badVal.valid);
     CHECK(badVal.failingNodeId == "node_fresnel");
 
-    // 3. 2D Pixel-Art Canvas with Mirror-X Symmetry & Flood Fill (PLZ-ART-007, PLZ-ARCH-005)
+    // 3. Multi-Layer 2D Pixel-Art Canvas with Mirror-X Symmetry, Layer Compositing & Binary PLZT Serialization
     creative::PixelArtCanvas canvas(16, 16);
+    CHECK(canvas.layers.size() == 2);
+    uint32_t layer3 = canvas.AddLayer("AccentSparks");
+    CHECK(layer3 == 2);
     canvas.SetIndex(2, 4, 5, /*mirrorX=*/true);
     CHECK(canvas.GetIndex(2, 4) == 5);
     CHECK(canvas.GetIndex(13, 4) == 5); // Mirrored across 16px width!
     auto bakedSprite = canvas.BakeToImageData2D();
     CHECK(bakedSprite.pixelExactNearest);
     CHECK(bakedSprite.width == 16);
+    CHECK(bakedSprite.GetPixel(2, 4) == canvas.palette[5]);
 
-    // 4. Coordinated 3-Role PLATZ AI Workflow + Dual Native Specialists (PLZ-AIX-003, PLZ-AIX-006)
+    auto plztBlob = bakedSprite.SerializeToBinaryBlob();
+    creative::ImageData2D decodedSprite;
+    REQUIRE(creative::ImageData2D::DeserializeFromBinaryBlob(plztBlob, &decodedSprite));
+    CHECK(decodedSprite.width == 16);
+    CHECK(decodedSprite.pixelExactNearest);
+    CHECK(decodedSprite.GetPixel(2, 4) == canvas.palette[5]);
+
+    // 4. Honest Measured Holdout Metrics on Dual Native Specialists + Coordinated 3-Role AI Workflow
     core::ProjectState proj;
     core::ObjectId targetId = proj.CreateObject("HeroDrone", "cube").id;
 
@@ -223,10 +254,24 @@ TEST_CASE("Gate 4: Non-Destructive 3D Modifier Stack, Visual Material Node Graph
     std::vector<ai::TrainingSample> tr, ho;
     ai::NativeMaterialSpecialistModel::BuildDefaultCuratedDataset(&tr, &ho);
     ai::TrainingHyperparameters hp;
-    CHECK(matSpec.TrainAndEvaluate(tr, ho, hp).convergedAndQualified);
+    auto matRec = matSpec.TrainAndEvaluate(tr, ho, hp);
+    CHECK(matRec.convergedAndQualified);
+    CHECK(matRec.finalHoldoutMse < matRec.baselineHoldoutMse * 0.35f);
+    CHECK(matRec.holdoutRSquared > 0.75f);
+    CHECK(matRec.holdoutMae > 0.0f);
+    CHECK(matRec.holdoutMae < 0.12f);
+    CHECK(matRec.inferenceTimingPasses >= 10000u);
+    CHECK(matRec.avgInferenceLatencyUs > 0.0);
 
     ai::NativeGameplayBalanceSpecialistModel gpSpec;
-    CHECK(gpSpec.TrainDefaultGameplaySpecialist().convergedAndQualified);
+    auto gpRec = gpSpec.TrainDefaultGameplaySpecialist();
+    CHECK(gpRec.convergedAndQualified);
+    CHECK(gpRec.finalHoldoutMse < gpRec.baselineHoldoutMse * 0.35f);
+    CHECK(gpRec.holdoutRSquared > 0.70f);
+    CHECK(gpRec.holdoutMae > 0.0f);
+    CHECK(gpRec.holdoutMae < 0.12f);
+    CHECK(gpRec.inferenceTimingPasses >= 8000u);
+    CHECK(gpRec.avgInferenceLatencyUs > 0.0);
 
     ai::CommandRegistry reg;
     ai::StagedAiSession session(reg);
@@ -236,4 +281,46 @@ TEST_CASE("Gate 4: Non-Destructive 3D Modifier Stack, Visual Material Node Graph
     CHECK(roleRec.commandsStaged == 2);
     CHECK(session.ApproveAndCommit(roleRec.sessionToken, proj));
     CHECK_FALSE(proj.FindObject(targetId)->logic.rules.empty());
+
+    // 5. Unified Keyframed Animation Evaluator (Linear, EaseInOut, Step) + Typed Commands
+    core::SceneObject animObj;
+    animObj.animation.enabled = true;
+    animObj.animation.loop = true;
+    animObj.animation.durationSec = 2.0f;
+    animObj.animation.tracks.push_back({"tr_pos", "position", {{0.0f, {0.0f, 0.0f, 0.0f}, "Linear"}, {2.0f, {10.0f, 0.0f, 0.0f}, "Linear"}}});
+    animObj.animation.tracks.push_back({"tr_scl", "scale", {{0.0f, {1.0f, 1.0f, 1.0f}, "Step"}, {2.0f, {3.0f, 3.0f, 3.0f}, "Step"}}});
+    animObj.animation.tracks.push_back({"tr_em", "emissiveStrength", {{0.0f, {0.0f, 0.0f, 0.0f}, "EaseInOut"}, {2.0f, {4.0f, 0.0f, 0.0f}, "EaseInOut"}}});
+
+    engine::runtime::RuntimeSession::EvaluateObjectAnimationAtTime(animObj, 0.5);
+    CHECK(animObj.transform.position.x == doctest::Approx(2.5f));
+    CHECK(animObj.transform.scale.x == doctest::Approx(1.0f)); // Step holds previous keyframe until t=2.0
+    // Smoothstep at u=0.25: 3*(0.25)^2 - 2*(0.25)^3 = 0.15625 * 4.0 = 0.625
+    CHECK(animObj.material.emissiveStrength == doctest::Approx(0.625f));
+
+    // Verify new CommandRegistry commands for Animation & Audio + invalid Material DAG rejection
+    ai::CapabilityGrant grant;
+    ai::TypedCommandRequest kfReq;
+    kfReq.commandName = "object.add_animation_keyframe";
+    kfReq.expectedRevision = proj.GetHeadRevision();
+    kfReq.targetObjectId = targetId;
+    kfReq.parameters = {{"propertyPath", "position"}, {"timeSec", 1.5f}, {"value", {2.0f, 3.0f, 4.0f}}, {"interpolation", "EaseInOut"}};
+    CHECK(reg.ValidateAndApplyCommand(proj, grant, kfReq).valid);
+    CHECK(proj.FindObject(targetId)->animation.enabled);
+    CHECK(proj.FindObject(targetId)->animation.tracks.size() == 1);
+
+    ai::TypedCommandRequest audReq;
+    audReq.commandName = "object.set_audio_source";
+    audReq.expectedRevision = proj.GetHeadRevision();
+    audReq.targetObjectId = targetId;
+    audReq.parameters = {{"enabled", true}, {"cueType", "CrystalChime"}, {"volume", 0.7f}, {"pitch", 1.2f}};
+    CHECK(reg.ValidateAndApplyCommand(proj, grant, audReq).valid);
+    CHECK(proj.FindObject(targetId)->audio.enabled);
+    CHECK(proj.FindObject(targetId)->audio.cueType == "CrystalChime");
+
+    ai::TypedCommandRequest badGraphReq;
+    badGraphReq.commandName = "object.set_material_graph";
+    badGraphReq.expectedRevision = proj.GetHeadRevision();
+    badGraphReq.targetObjectId = targetId;
+    badGraphReq.parameters = {{"materialGraphJson", "{broken json!!!"}};
+    CHECK_FALSE(reg.ValidateCommand(proj, grant, badGraphReq).valid);
 }

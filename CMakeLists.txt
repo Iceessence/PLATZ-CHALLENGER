@@ -108,6 +108,7 @@ target_compile_definitions(platz_third_party PUBLIC
 add_library(platz_engine STATIC
     src/platform/platform_paths.cpp
     src/platform/sdl_window.cpp
+    src/platform/audio_engine.cpp
     src/core/object_identity.cpp
     src/core/asset_store.cpp
     src/core/project_db.cpp

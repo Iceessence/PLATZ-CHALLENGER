@@ -1,8 +1,10 @@
 #include "ai/command_registry.h"
+#include "creative/texture_generator.h"
 #include "platform/platform_paths.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 
 namespace platz::ai {
 
@@ -24,9 +26,11 @@ CommandRegistry::CommandRegistry() {
         {"object.create", "Scene", "Create a new canonical 3D SceneObject with validated transform and mesh", true},
         {"object.set_transform", "Scene", "Update position, rotationEulerDeg, or scale of a stable ObjectId", true},
         {"object.set_material", "Material", "Update PBR metallic, roughness, baseColor, or emissive parameters", true},
-        {"object.set_modifier_stack", "3D Modeling", "Update non-destructive 3D mesh modifier stack on a stable ObjectId", true},
-        {"object.set_material_graph", "Material", "Attach a validated Visual Material Node Graph JSON to a stable ObjectId", true},
+        {"object.set_modifier_stack", "3D Modeling", "Update CPU-evaluated non-destructive 3D mesh modifier stack on a stable ObjectId", true},
+        {"object.set_material_graph", "Material", "Attach a validated DAG Visual Material Node Graph JSON to a stable ObjectId", true},
         {"object.add_behavior_rule", "Logic", "Attach a validated no-code BehaviorRule to a stable ObjectId", true},
+        {"object.add_animation_keyframe", "Animation", "Add a validated keyframe to an object's AnimationComponent timeline track", true},
+        {"object.set_audio_source", "Audio", "Configure spatial 3D procedural audio cue and DSP filter parameters on an object", true},
         {"object.delete", "Scene", "Delete a canonical SceneObject by stable ObjectId (requires allowDeleteObjects)", true}
     };
 }
@@ -107,7 +111,9 @@ CommandValidationResult CommandRegistry::ValidateCommand(
     }
     if ((request.commandName == "object.create" ||
          request.commandName == "object.set_transform" ||
-         request.commandName == "object.set_modifier_stack") &&
+         request.commandName == "object.set_modifier_stack" ||
+         request.commandName == "object.add_animation_keyframe" ||
+         request.commandName == "object.set_audio_source") &&
         !hostGrant.allowMutateScene) {
         res.permissionDenied = true;
         res.errorCode = "ERR_PERMISSION_DENIED";
@@ -226,6 +232,52 @@ CommandValidationResult CommandRegistry::ValidateCommand(
         if (!p.contains("materialGraphJson") || !p["materialGraphJson"].is_string()) {
             res.errorCode = "ERR_INVALID_SCHEMA";
             res.diagnosticMessage = "object.set_material_graph requires string 'materialGraphJson'";
+            return res;
+        }
+        std::string graphStr = p["materialGraphJson"].get<std::string>();
+        auto parsedJson = nlohmann::json::parse(graphStr, nullptr, false);
+        if (parsedJson.is_discarded() || !parsedJson.contains("nodes") || !parsedJson["nodes"].is_array()) {
+            res.errorCode = "ERR_INVALID_MATERIAL_GRAPH";
+            res.diagnosticMessage = "Invalid materialGraphJson: missing valid 'nodes' array";
+            return res;
+        }
+        auto parsedGraph = creative::MaterialGraphDocument::FromJsonString(graphStr);
+        auto val = parsedGraph.ValidateGraph();
+        if (!val.valid) {
+            res.errorCode = "ERR_INVALID_MATERIAL_GRAPH";
+            res.diagnosticMessage = "Material DAG validation failed: " + val.diagnosticMessage;
+            return res;
+        }
+    } else if (request.commandName == "object.add_animation_keyframe") {
+        if (!p.contains("propertyPath") || !p["propertyPath"].is_string() ||
+            !p.contains("timeSec") || !p["timeSec"].is_number() ||
+            !p.contains("value") || !p["value"].is_array() || p["value"].size() != 3) {
+            res.errorCode = "ERR_INVALID_SCHEMA";
+            res.diagnosticMessage = "object.add_animation_keyframe requires propertyPath, timeSec >= 0, and vec3 value";
+            return res;
+        }
+        float t = p["timeSec"].get<float>();
+        if (!std::isfinite(t) || t < 0.0f) {
+            res.errorCode = "ERR_INVALID_SCHEMA";
+            res.diagnosticMessage = "Animation keyframe timeSec must be finite and >= 0";
+            return res;
+        }
+        for (int i = 0; i < 3; ++i) {
+            if (!p["value"][i].is_number() || !std::isfinite(p["value"][i].get<float>())) {
+                res.errorCode = "ERR_INVALID_SCHEMA";
+                res.diagnosticMessage = "Animation keyframe value must contain finite numbers";
+                return res;
+            }
+        }
+    } else if (request.commandName == "object.set_audio_source") {
+        if (p.contains("volume") && (!p["volume"].is_number() || p["volume"].get<float>() < 0.0f || p["volume"].get<float>() > 1.0f)) {
+            res.errorCode = "ERR_INVALID_SCHEMA";
+            res.diagnosticMessage = "Audio volume must be in [0.0, 1.0]";
+            return res;
+        }
+        if (p.contains("pitch") && (!p["pitch"].is_number() || p["pitch"].get<float>() < 0.25f || p["pitch"].get<float>() > 4.0f)) {
+            res.errorCode = "ERR_INVALID_SCHEMA";
+            res.diagnosticMessage = "Audio pitch must be in [0.25, 4.0]";
             return res;
         }
     } else if (request.commandName == "object.create") {
@@ -375,6 +427,52 @@ CommandValidationResult CommandRegistry::ValidateAndApplyCommand(
         }
     } else if (request.commandName == "object.set_material_graph") {
         updated.material.materialGraphJson = p["materialGraphJson"].get<std::string>();
+    } else if (request.commandName == "object.add_animation_keyframe") {
+        std::string propPath = p["propertyPath"].get<std::string>();
+        core::AnimationKeyframe kf;
+        kf.timeSec = p["timeSec"].get<float>();
+        kf.value = {p["value"][0].get<float>(), p["value"][1].get<float>(), p["value"][2].get<float>()};
+        kf.interpolation = p.value("interpolation", std::string("EaseInOut"));
+
+        updated.animation.enabled = true;
+        if (p.contains("durationSec") && p["durationSec"].is_number()) {
+            updated.animation.durationSec = std::max(0.1f, p["durationSec"].get<float>());
+        } else if (kf.timeSec > updated.animation.durationSec) {
+            updated.animation.durationSec = kf.timeSec;
+        }
+        if (p.contains("loop") && p["loop"].is_boolean()) {
+            updated.animation.loop = p["loop"].get<bool>();
+        }
+
+        core::AnimationTrack* targetTrack = nullptr;
+        for (auto& tr : updated.animation.tracks) {
+            if (tr.targetProperty == propPath) {
+                targetTrack = &tr;
+                break;
+            }
+        }
+        if (!targetTrack) {
+            core::AnimationTrack newTr;
+            newTr.trackId = "track_" + propPath;
+            newTr.targetProperty = propPath;
+            updated.animation.tracks.push_back(std::move(newTr));
+            targetTrack = &updated.animation.tracks.back();
+        }
+        targetTrack->keyframes.push_back(kf);
+        std::sort(targetTrack->keyframes.begin(), targetTrack->keyframes.end(),
+            [](const core::AnimationKeyframe& a, const core::AnimationKeyframe& b) {
+                return a.timeSec < b.timeSec;
+            });
+    } else if (request.commandName == "object.set_audio_source") {
+        updated.audio.enabled = p.value("enabled", true);
+        if (p.contains("cueType") && p["cueType"].is_string()) updated.audio.cueType = p["cueType"].get<std::string>();
+        if (p.contains("volume") && p["volume"].is_number()) updated.audio.volume = p["volume"].get<float>();
+        if (p.contains("pitch") && p["pitch"].is_number()) updated.audio.pitch = p["pitch"].get<float>();
+        if (p.contains("maxDistance") && p["maxDistance"].is_number()) updated.audio.maxDistance = std::max(1.0f, p["maxDistance"].get<float>());
+        if (p.contains("spatial3D") && p["spatial3D"].is_boolean()) updated.audio.spatial3D = p["spatial3D"].get<bool>();
+        if (p.contains("playOnInteract") && p["playOnInteract"].is_boolean()) updated.audio.playOnInteract = p["playOnInteract"].get<bool>();
+        if (p.contains("playOnCollision") && p["playOnCollision"].is_boolean()) updated.audio.playOnCollision = p["playOnCollision"].get<bool>();
+        if (p.contains("lowPassCutoffHz") && p["lowPassCutoffHz"].is_number()) updated.audio.lowPassCutoffHz = std::clamp(p["lowPassCutoffHz"].get<float>(), 200.0f, 20000.0f);
     } else if (request.commandName == "object.add_behavior_rule") {
         core::BehaviorRule rule;
         rule.ruleId = p.value("ruleId", "ai_rule_" + std::to_string(updated.logic.rules.size() + 1));

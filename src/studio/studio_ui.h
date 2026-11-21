@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+namespace platz::platform {
+class SpatialAudioEngine;
+}
+
 namespace platz::studio {
 
 enum class WorkspaceMode {
@@ -21,7 +25,8 @@ enum class WorkspaceMode {
     ModelAndAssets = 1,
     MaterialsAndShaders = 2,
     PixelArtAndSprites = 3,
-    PlatzAiWorkbench = 4
+    AnimationAndAudio = 4,
+    PlatzAiWorkbench = 5
 };
 
 enum class ComplexityTier {
@@ -95,8 +100,21 @@ public:
         ai::StagedAiSession& stagedAiSession,
         ai::NativeMaterialSpecialistModel& specialistModel);
 
+    void AttachAudioEngine(platform::SpatialAudioEngine* audioEngine) { audioEngine_ = audioEngine; }
+
+    // Advance editor-only animation scrub preview when not in full Play mode
+    void AdvanceEditorPreview(double dt);
+
     // Draws the complete Dear ImGui Docking Studio workspace (called inside RenderInteractiveFrame)
     void BuildImGuiStudioFrame();
+
+    // Synchronize Material Graph and Multi-Layer Pixel-Art Studio editors from the currently selected project object
+    // (automatically called on selection change, ReloadFromDisk, Undo, Redo, and startup)
+    void SyncEditorsFromSelectedObject(bool forceReload = false);
+
+    // Persist active Material Graph or Multi-Layer Pixel Canvas onto the selected object with full Undo/Redo & asset lineage
+    bool CommitMaterialGraphToSelectedObject(const std::string& actionLabel = "Edit Material DAG");
+    bool CommitPixelCanvasToSelectedObject(const std::string& actionLabel = "Edit Pixel-Art Canvas");
 
     // Programmatic DockBuilder layout reset / recovery (PLZ-UX-003, PLZ-UX-004, PLZ-CREATEX2-007)
     void RequestDockLayoutReset() { dockLayoutNeedsBuild_ = true; }
@@ -151,6 +169,7 @@ private:
     void DrawAssetAndValidationWorldPanel();
     void DrawMaterialGraphAndSlangPanel();
     void DrawPixelArtAndSpriteStudioPanel();
+    void DrawAnimationTimelinePanel();
     void DrawLogicAndRuntimeHudPanel();
     void DrawPlatzAiAndSpecialistPanel();
 
@@ -161,8 +180,11 @@ private:
     ai::StagedAiSession& stagedAiSession_;
     ai::NativeMaterialSpecialistModel& specialistModel_;
     ai::NativeGameplayBalanceSpecialistModel gameplaySpecialist_;
+    platform::SpatialAudioEngine* audioEngine_{nullptr};
 
     core::ObjectId selectedObjectId_{0};
+    core::ObjectId lastSyncedObjectId_{0};
+    uint64_t lastSyncedMutationGen_{0};
     engine::scene::ViewportCamera camera_;
     engine::scene::GizmoMode gizmoMode_{engine::scene::GizmoMode::Translate};
     engine::scene::SnapSettings snapSettings_{};
@@ -171,6 +193,7 @@ private:
 
     ThemeSpecification activeTheme_{};
     ProtectedSecurityBarState protectedBarState_{};
+    mutable bool themeDirty_{true};
     float uiScale_{1.0f};
     bool dockLayoutNeedsBuild_{true};
     std::string pendingFocusWindowName_;
@@ -183,14 +206,25 @@ private:
     glm::vec2 gizmoDragStartMouse_{0.0f};
     core::TransformComponent gizmoDragStartTransform_{};
 
-    // Material Graph & 2D Pixel Art live authoring states
+    // Expandable DAG Material Graph state (persisted per selected object)
     creative::MaterialGraphDocument materialGraph_;
+    std::string selectedMatNodeId_{"node_checker"};
     std::string lastCompiledSlangPreview_;
-    std::string materialGraphDiagnostic_{"Material graph ready (4 nodes connected to PbrOutput)."};
+    std::string materialGraphDiagnostic_{"Material DAG ready."};
 
+    // Multi-Layer 2D Pixel Art live authoring state (persisted per selected object with full Undo/Redo)
     creative::PixelArtCanvas pixelCanvas_{16, 16};
     uint8_t activePixelPaletteIdx_{1};
     bool pixelMirrorSymmetry_{true};
+    int pixelToolMode_{0}; // 0 = Brush, 1 = Eraser, 2 = FloodFill
+    bool pixelStrokeInProgress_{false};
+    std::string pixelPreStrokeJson_;
+
+    // Unified Animation Timeline non-destructive preview state
+    bool animPreviewPlaying_{false};
+    float animPreviewTimeSec_{0.0f};
+    int animKeyframeInterpIdx_{0}; // 0 = EaseInOut, 1 = Linear, 2 = Step
+    mutable std::vector<core::SceneObject> animPreviewObjectsCache_;
 
     // Time-travel visual logic debugger state
     int debuggerTimelineScrubIndex_{-1};

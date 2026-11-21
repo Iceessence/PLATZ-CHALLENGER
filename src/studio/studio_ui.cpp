@@ -1,6 +1,7 @@
 #include "studio/studio_ui.h"
 #include "creative/asset_importer.h"
 #include "creative/mesh_generator.h"
+#include "platform/audio_engine.h"
 #include "platform/platform_paths.h"
 
 #include <imgui.h>
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 
 namespace platz::studio {
 
@@ -116,13 +118,209 @@ StudioUiController::StudioUiController(
         gameplaySpecialist_.TrainDefaultGameplaySpecialist();
     }
 
-    materialGraph_.CompileToSlangShaderSource(&lastCompiledSlangPreview_);
+    SyncEditorsFromSelectedObject(true);
 
     customToolbarBindings_ = {
         {"+ Twist Modifier", "model.add_taper_twist"},
         {"AI 3-Role Enhance", "ai.run_three_role_workflow"},
         {"Compile Material Graph", "material.compile_graph_slang"}
     };
+}
+
+void StudioUiController::AdvanceEditorPreview(double dt) {
+    if (runtime_.IsPlaying() || !animPreviewPlaying_) return;
+    const core::SceneObject* sel = project_.FindObject(selectedObjectId_);
+    if (!sel || !sel->animation.enabled || sel->animation.tracks.empty()) {
+        animPreviewPlaying_ = false;
+        return;
+    }
+    float dur = std::max(0.1f, sel->animation.durationSec);
+    animPreviewTimeSec_ += static_cast<float>(std::clamp(dt, 0.0, 0.1));
+    if (animPreviewTimeSec_ > dur) {
+        if (sel->animation.loop) {
+            animPreviewTimeSec_ = std::fmod(animPreviewTimeSec_, dur);
+        } else {
+            animPreviewTimeSec_ = dur;
+            animPreviewPlaying_ = false;
+        }
+    }
+}
+
+void StudioUiController::SyncEditorsFromSelectedObject(bool forceReload) {
+    uint64_t curGen = project_.GetMutationGeneration();
+    if (!forceReload && selectedObjectId_ == lastSyncedObjectId_ && curGen == lastSyncedMutationGen_) {
+        return;
+    }
+    lastSyncedObjectId_ = selectedObjectId_;
+    lastSyncedMutationGen_ = curGen;
+
+    const core::SceneObject* sel = project_.FindObject(selectedObjectId_);
+
+    // 1. Load Material Graph from selected object's persisted source JSON
+    if (sel && !sel->material.materialGraphJson.empty()) {
+        auto parsedJson = nlohmann::json::parse(sel->material.materialGraphJson, nullptr, false);
+        if (!parsedJson.is_discarded() && parsedJson.contains("nodes") && parsedJson["nodes"].is_array()) {
+            materialGraph_ = creative::MaterialGraphDocument::FromJsonString(sel->material.materialGraphJson);
+            auto val = materialGraph_.ValidateGraph();
+            materialGraphDiagnostic_ = val.valid
+                ? ("Loaded saved DAG (" + std::to_string(materialGraph_.GetNodes().size()) + " nodes) from " + sel->name)
+                : ("Loaded DAG with validation error @ " + val.failingNodeId + ": " + val.diagnosticMessage);
+        } else {
+            materialGraph_.BuildDefaultProceduralGraph();
+            materialGraphDiagnostic_ = "Fallback default graph (source JSON malformed)";
+        }
+    } else {
+        materialGraph_.BuildDefaultProceduralGraph();
+        if (sel) {
+            if (auto* alb = materialGraph_.FindNode("node_albedo")) {
+                alb->colorParam = glm::vec3(sel->material.baseColor);
+            }
+            materialGraphDiagnostic_ = "Template PBR DAG for " + sel->name + " (edit or compile to persist)";
+        }
+    }
+
+    if (!materialGraph_.FindNode(selectedMatNodeId_) && !materialGraph_.GetNodes().empty()) {
+        selectedMatNodeId_ = materialGraph_.GetNodes().front().nodeId;
+        for (const auto& n : materialGraph_.GetNodes()) {
+            if (n.nodeType != "PbrOutput") {
+                selectedMatNodeId_ = n.nodeId;
+            }
+        }
+    }
+
+    std::string slangOut;
+    if (materialGraph_.CompileToSlangShaderSource(&slangOut)) {
+        lastCompiledSlangPreview_ = std::move(slangOut);
+    }
+    if (renderer_.IsInitialized()) {
+        renderer_.UpdateMaterialGraphPreviewTexture(materialGraph_.BakeGraphAlbedoTexture(128, 128));
+    }
+
+    // 2. Load Multi-Layer Pixel-Art Canvas from selected object's persisted source JSON (or pixel_source blob)
+    bool loadedPixelSource = false;
+    if (sel && !sel->material.pixelCanvasJson.empty()) {
+        auto parsedPxJson = nlohmann::json::parse(sel->material.pixelCanvasJson, nullptr, false);
+        if (!parsedPxJson.is_discarded() && parsedPxJson.is_object()) {
+            pixelCanvas_ = creative::PixelArtCanvas::FromJson(parsedPxJson);
+            loadedPixelSource = true;
+        }
+    }
+    if (!loadedPixelSource && sel && sel->material.pixelSourceAssetId != 0) {
+        if (const auto* ast = project_.FindAsset(sel->material.pixelSourceAssetId)) {
+            auto blob = project_.GetAssetStore().ReadBlobVerified(ast->contentSha256);
+            if (blob) {
+                std::string jsonStr(blob->begin(), blob->end());
+                auto parsedPxJson = nlohmann::json::parse(jsonStr, nullptr, false);
+                if (!parsedPxJson.is_discarded() && parsedPxJson.is_object()) {
+                    pixelCanvas_ = creative::PixelArtCanvas::FromJson(parsedPxJson);
+                    loadedPixelSource = true;
+                }
+            }
+        }
+    }
+    if (!loadedPixelSource) {
+        pixelCanvas_ = creative::PixelArtCanvas(16, 16);
+        if (sel) {
+            pixelCanvas_.spriteName = sel->name + "_Sprite";
+        }
+    }
+    if (renderer_.IsInitialized()) {
+        renderer_.UpdatePixelArtPreviewTexture(pixelCanvas_.BakeToImageData2D());
+    }
+}
+
+bool StudioUiController::CommitMaterialGraphToSelectedObject(const std::string& actionLabel) {
+    auto val = materialGraph_.ValidateGraph();
+    if (!val.valid) {
+        materialGraphDiagnostic_ = "[DAG ERROR @ " + val.failingNodeId + "] " + val.diagnosticMessage;
+        statusBannerMessage_ = materialGraphDiagnostic_;
+        return false;
+    }
+
+    std::string slangOut;
+    if (materialGraph_.CompileToSlangShaderSource(&slangOut)) {
+        lastCompiledSlangPreview_ = std::move(slangOut);
+    }
+    if (renderer_.IsInitialized()) {
+        renderer_.UpdateMaterialGraphPreviewTexture(materialGraph_.BakeGraphAlbedoTexture(128, 128));
+    }
+
+    core::SceneObject* sel = project_.FindObject(selectedObjectId_);
+    if (!sel) return false;
+
+    core::SceneObject updated = *sel;
+    updated.material.materialGraphJson = materialGraph_.ToJsonString();
+    bool ok = project_.ApplyObjectMutation(sel->id, updated, actionLabel, "Material", "User");
+    if (ok) {
+        lastSyncedMutationGen_ = project_.GetMutationGeneration();
+        materialGraphDiagnostic_ = "Saved DAG (" + std::to_string(materialGraph_.GetNodes().size()) +
+                                   " nodes) to " + sel->name + " (undoable & SQLite-ready).";
+    }
+    return ok;
+}
+
+bool StudioUiController::CommitPixelCanvasToSelectedObject(const std::string& actionLabel) {
+    auto bakedImg = pixelCanvas_.BakeToImageData2D();
+    if (renderer_.IsInitialized()) {
+        renderer_.UpdatePixelArtPreviewTexture(bakedImg);
+    }
+
+    core::SceneObject* sel = project_.FindObject(selectedObjectId_);
+    if (!sel) return false;
+
+    std::string sourceJson = pixelCanvas_.ToJsonString();
+    std::vector<uint8_t> sourceBytes(sourceJson.begin(), sourceJson.end());
+    std::string srcSha = platform::ComputeSha256Hex(sourceBytes);
+
+    core::AssetId srcAssetId = sel->material.pixelSourceAssetId;
+    const auto* existingSrc = (srcAssetId != 0) ? project_.FindAsset(srcAssetId) : nullptr;
+    if (!existingSrc || existingSrc->contentSha256 != srcSha) {
+        auto regSrc = project_.RegisterBinaryAsset(
+            pixelCanvas_.spriteName + "_Source",
+            "pixel_source",
+            sourceBytes,
+            "assets/sprites/" + pixelCanvas_.spriteName + ".platzpx.json",
+            "{}",
+            "PLATZ-Internal");
+        if (regSrc) srcAssetId = *regSrc;
+    }
+
+    auto texBlob = bakedImg.SerializeToBinaryBlob();
+    std::string texSha = platform::ComputeSha256Hex(texBlob);
+    core::AssetId texAssetId = sel->material.albedoTextureAssetId;
+    const auto* existingTex = (texAssetId != 0) ? project_.FindAsset(texAssetId) : nullptr;
+    if (!existingTex || existingTex->contentSha256 != texSha) {
+        nlohmann::json lineage = {
+            {"sourcePixelAssetId", srcAssetId},
+            {"layerCount", pixelCanvas_.layers.size()},
+            {"filter", "VK_FILTER_NEAREST"}
+        };
+        auto regTex = project_.RegisterBinaryAsset(
+            pixelCanvas_.spriteName + "_Texture",
+            "texture",
+            texBlob,
+            "assets/sprites/" + pixelCanvas_.spriteName + ".plzt",
+            lineage.dump(),
+            "PLATZ-Internal");
+        if (regTex) texAssetId = *regTex;
+    }
+
+    core::SceneObject updated = *sel;
+    updated.material.pixelCanvasJson = sourceJson;
+    updated.material.pixelSourceAssetId = srcAssetId;
+    updated.material.albedoTextureAssetId = texAssetId;
+    updated.material.useProceduralChecker = false;
+    if (sel->material.albedoTextureAssetId == 0) {
+        updated.material.baseColor = {1.0f, 1.0f, 1.0f, 1.0f};
+    }
+
+    bool ok = project_.ApplyObjectMutation(sel->id, updated, actionLabel, "PixelArt", "User");
+    if (ok) {
+        lastSyncedMutationGen_ = project_.GetMutationGeneration();
+        statusBannerMessage_ = "Saved editable " + std::to_string(pixelCanvas_.layers.size()) +
+                               "-layer pixel canvas & bound live Vulkan texture on " + sel->name;
+    }
+    return ok;
 }
 
 void StudioUiController::RegisterDefaultCommandEntries() {
@@ -146,7 +344,7 @@ void StudioUiController::RegisterDefaultCommandEntries() {
         {"ai.run_three_role_workflow", "PLATZ AI: Run 3-Role Coordinated Specialist Synthesis (Planner + 2 Neural Models + Critic)", "PLATZ AI", "ai 3-role coordinator planner specialist critic stage", "", "VERIFIED"},
         {"ai.emergency_stop", "EMERGENCY STOP: Revoke Active PLATZ AI Session", "Security", "stop cancel revoke ai emergency safety", "Esc", "VERIFIED"},
         {"ai.train_specialist", "Train Native 12x24x7 & 10x20x5 PLATZ Specialist Models", "PLATZ AI", "train model neural specialist pareto holdout", "", "VERIFIED"},
-        {"qa.run_validation_route", "Run Automated 8-Station Validation World Route", "QA & Validation", "test verify validation world stations route qa", "F9", "VERIFIED"},
+        {"qa.run_validation_route", "Run Automated 9-Station Validation World Route", "QA & Validation", "test verify validation world stations route qa", "F9", "VERIFIED"},
         {"ui.reset_layout", "Reset & Recover Docked Studio Workspace Layout", "UI & Accessibility", "reset layout dock recover windows panels", "", "VERIFIED"},
         {"theme.obsidian", "Switch Theme: PZ Obsidian Dark", "UI & Accessibility", "theme dark obsidian color style", "", "VERIFIED"},
         {"theme.high_contrast", "Switch Theme: PZ High-Contrast Accessible", "UI & Accessibility", "theme contrast accessible vision screen reader", "", "VERIFIED"},
@@ -154,7 +352,8 @@ void StudioUiController::RegisterDefaultCommandEntries() {
         {"workspace.model", "Switch Workspace: 3D Modeling & Mesh Lab", "Workspace", "workspace model mesh modifier subdivide", "Alt+2", "VERIFIED"},
         {"workspace.materials", "Switch Workspace: Materials & Shader Graph", "Workspace", "workspace material shader slang pbr", "Alt+3", "VERIFIED"},
         {"workspace.pixel", "Switch Workspace: 2D Pixel-Art & Sprite Studio", "Workspace", "workspace pixel art sprite 2d tilemap", "Alt+4", "VERIFIED"},
-        {"workspace.ai", "Switch Workspace: Logic, Gameplay & PLATZ AI Workbench", "Workspace", "workspace ai specialist training commands logic", "Alt+5", "VERIFIED"},
+        {"workspace.animation", "Switch Workspace: Animation Timeline & Spatial Audio", "Workspace", "workspace animation timeline keyframe audio dsp", "Alt+5", "VERIFIED"},
+        {"workspace.ai", "Switch Workspace: Logic, Gameplay & PLATZ AI Workbench", "Workspace", "workspace ai specialist training commands logic", "Alt+6", "VERIFIED"},
         {"future.raytracing_pathtracer", "Hardware Ray/Path Tracing GI Mode (Long-Term Target)", "Future Target", "raytracing pathtracing gi global illumination", "", "BACKLOG / LONG-TERM TARGET"}
     };
 }
@@ -193,6 +392,7 @@ bool StudioUiController::InvokeCommandById(const std::string& commandId, std::st
     if (commandId == "edit.undo") {
         std::string lbl;
         if (project_.Undo(&lbl)) {
+            SyncEditorsFromSelectedObject(false);
             setMsg("Undid: " + lbl);
             return true;
         }
@@ -202,6 +402,7 @@ bool StudioUiController::InvokeCommandById(const std::string& commandId, std::st
     if (commandId == "edit.redo") {
         std::string lbl;
         if (project_.Redo(&lbl)) {
+            SyncEditorsFromSelectedObject(false);
             setMsg("Redid: " + lbl);
             return true;
         }
@@ -301,39 +502,18 @@ bool StudioUiController::InvokeCommandById(const std::string& commandId, std::st
                 return false;
             }
         }
-        if (core::SceneObject* sel = project_.FindObject(selectedObjectId_)) {
-            core::SceneObject updated = *sel;
-            updated.material.materialGraphJson = materialGraph_.ToJsonString();
-            project_.ApplyObjectMutation(sel->id, updated, "Compile & Bind Material Graph", "Material", "User");
-        }
-        materialGraphDiagnostic_ = "Compiled Visual Material Graph -> Slang 2026.22.1 -> SPIR-V 1.5 & hot-reloaded Vulkan pipeline.";
+        CommitMaterialGraphToSelectedObject("Compile & Bind Material DAG");
+        materialGraphDiagnostic_ = "Compiled " + std::to_string(materialGraph_.GetNodes().size()) +
+                                   "-node DAG -> Slang 2026.22.1 -> SPIR-V 1.5 & hot-reloaded Vulkan pipeline.";
         setMsg(materialGraphDiagnostic_);
         return true;
     }
     if (commandId == "pixel.apply_sprite_to_object") {
-        auto img = pixelCanvas_.BakeToImageData2D();
-        if (renderer_.IsInitialized()) {
-            renderer_.UpdatePixelArtPreviewTexture(img);
-        }
-        std::string err;
-        auto assetIdOpt = project_.RegisterBinaryAsset(
-            pixelCanvas_.spriteName,
-            "texture",
-            img.rgbaPixels,
-            "assets/sprites/" + pixelCanvas_.spriteName + ".raw",
-            pixelCanvas_.ToJson().dump(),
-            "PLATZ-Internal",
-            &err);
-        if (assetIdOpt && selectedObjectId_ != 0) {
-            if (core::SceneObject* sel = project_.FindObject(selectedObjectId_)) {
-                core::SceneObject updated = *sel;
-                updated.material.albedoTextureAssetId = *assetIdOpt;
-                updated.material.useProceduralChecker = true;
-                project_.ApplyObjectMutation(sel->id, updated, "Bind 2D Pixel-Art Sprite Texture", "PixelArt", "User");
-            }
-        }
-        setMsg("Baked 2D Pixel-Exact Sprite '" + pixelCanvas_.spriteName + "' into Content-Addressed Asset Store");
-        return assetIdOpt.has_value();
+        bool ok = CommitPixelCanvasToSelectedObject("Bake & Bind 2D Pixel-Art Sprite");
+        setMsg(ok ? ("Saved editable " + std::to_string(pixelCanvas_.layers.size()) +
+                     "-layer pixel canvas & bound live Vulkan texture")
+                  : "Select an object first to bind a pixel-art sprite texture");
+        return ok;
     }
     if (commandId == "ai.stage_gold_material") {
         if (selectedObjectId_ == 0) {
@@ -436,6 +616,10 @@ bool StudioUiController::InvokeCommandById(const std::string& commandId, std::st
         SetWorkspaceMode(WorkspaceMode::PixelArtAndSprites);
         return true;
     }
+    if (commandId == "workspace.animation") {
+        SetWorkspaceMode(WorkspaceMode::AnimationAndAudio);
+        return true;
+    }
     if (commandId == "workspace.ai") {
         SetWorkspaceMode(WorkspaceMode::PlatzAiWorkbench);
         return true;
@@ -475,11 +659,13 @@ ProtectedSecurityBarState StudioUiController::ApplyThemeWithProtectedControlGuar
     }
 
     protectedBarState_ = state;
+    themeDirty_ = true;
     return state;
 }
 
 void StudioUiController::ApplyThemeToImGui() const {
-    if (!ImGui::GetCurrentContext()) return;
+    if (!ImGui::GetCurrentContext() || !themeDirty_) return;
+    themeDirty_ = false;
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowPadding = ImVec2(10.0f * uiScale_, 10.0f * uiScale_);
     style.FramePadding = ImVec2(8.0f * uiScale_, 5.0f * uiScale_);
@@ -564,6 +750,9 @@ std::vector<PerformanceAdvisorHint> StudioUiController::AnalyzeScenePerformanceF
 void StudioUiController::SetSelectedObjectId(core::ObjectId id) {
     if (selectedObjectId_ != id) {
         selectedObjectId_ = id;
+        animPreviewPlaying_ = false;
+        animPreviewTimeSec_ = 0.0f;
+        SyncEditorsFromSelectedObject(false);
         if (const auto* obj = project_.FindObject(id)) {
             accessibility_.Announce("Selection", "Selected " + obj->name + " (" + core::FormatObjectId(id) + ")");
         }
@@ -589,6 +778,10 @@ void StudioUiController::SetWorkspaceMode(WorkspaceMode mode) {
             pendingFocusWindowName_ = "2D Pixel & Sprite Studio";
             accessibility_.Announce("Workspace", "Switched workspace to 2D Pixel-Art & Sprite Studio");
             break;
+        case WorkspaceMode::AnimationAndAudio:
+            pendingFocusWindowName_ = "Animation Timeline";
+            accessibility_.Announce("Workspace", "Switched workspace to Animation Timeline & Spatial Audio");
+            break;
         case WorkspaceMode::PlatzAiWorkbench:
             pendingFocusWindowName_ = "PLATZ AI & Specialists";
             accessibility_.Announce("Workspace", "Switched workspace to Logic, Gameplay & PLATZ AI Workbench");
@@ -598,11 +791,28 @@ void StudioUiController::SetWorkspaceMode(WorkspaceMode mode) {
 
 void StudioUiController::SetUiScale(float scale) {
     uiScale_ = std::clamp(scale, 0.85f, 2.0f);
+    themeDirty_ = true;
     accessibility_.Announce("Accessibility", "UI Scale set to " + std::to_string(static_cast<int>(uiScale_ * 100.0f)) + "%");
 }
 
 const std::vector<core::SceneObject>& StudioUiController::GetActiveSceneObjects() const {
-    return runtime_.IsPlaying() ? runtime_.GetRuntimeObjects() : project_.GetObjects();
+    if (runtime_.IsPlaying()) {
+        return runtime_.GetRuntimeObjects();
+    }
+    if (animPreviewPlaying_ || animPreviewTimeSec_ > 0.001f) {
+        const core::SceneObject* sel = project_.FindObject(selectedObjectId_);
+        if (sel && sel->animation.enabled && !sel->animation.tracks.empty()) {
+            animPreviewObjectsCache_ = project_.GetObjects();
+            for (auto& o : animPreviewObjectsCache_) {
+                if (o.id == selectedObjectId_) {
+                    engine::runtime::RuntimeSession::EvaluateObjectAnimationAtTime(o, animPreviewTimeSec_);
+                    break;
+                }
+            }
+            return animPreviewObjectsCache_;
+        }
+    }
+    return project_.GetObjects();
 }
 
 void StudioUiController::RebuildProgrammaticDockLayout(uint32_t dockspaceId) {
@@ -622,8 +832,8 @@ void StudioUiController::RebuildProgrammaticDockLayout(uint32_t dockspaceId) {
     // 2. Split Right Inspector (33% of remaining = ~26% total width, plenty of room so labels never clip!)
     ImGui::DockBuilderSplitNode(dockMain, ImGuiDir_Right, 0.33f, &dockRight, &dockMain);
 
-    // 3. Split Center into Top 3D Viewport (68% height) and Bottom Creation/Content Drawer (32% height)
-    ImGui::DockBuilderSplitNode(dockMain, ImGuiDir_Down, 0.32f, &dockCenterBottom, &dockMain);
+    // 3. Split Center into Top 3D Viewport (65% height) and Bottom Creation/Content Drawer (35% height)
+    ImGui::DockBuilderSplitNode(dockMain, ImGuiDir_Down, 0.35f, &dockCenterBottom, &dockMain);
 
     ImGui::DockBuilderDockWindow("Scene Outliner & Validation Stations", dockLeft);
     ImGui::DockBuilderDockWindow("Vulkan 1.4 3D Viewport", dockMain);
@@ -632,6 +842,7 @@ void StudioUiController::RebuildProgrammaticDockLayout(uint32_t dockspaceId) {
     ImGui::DockBuilderDockWindow("Asset Browser", dockCenterBottom);
     ImGui::DockBuilderDockWindow("Material Node Graph", dockCenterBottom);
     ImGui::DockBuilderDockWindow("2D Pixel & Sprite Studio", dockCenterBottom);
+    ImGui::DockBuilderDockWindow("Animation Timeline", dockCenterBottom);
     ImGui::DockBuilderDockWindow("No-Code Logic & Debugger", dockCenterBottom);
     ImGui::DockBuilderDockWindow("PLATZ AI & Specialists", dockCenterBottom);
 
@@ -640,6 +851,7 @@ void StudioUiController::RebuildProgrammaticDockLayout(uint32_t dockspaceId) {
 
 void StudioUiController::BuildImGuiStudioFrame() {
     ApplyThemeToImGui();
+    SyncEditorsFromSelectedObject(false);
 
     ImGuiIO& io = ImGui::GetIO();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_K, false)) {
@@ -681,6 +893,7 @@ void StudioUiController::BuildImGuiStudioFrame() {
     DrawAssetAndValidationWorldPanel();
     DrawMaterialGraphAndSlangPanel();
     DrawPixelArtAndSpriteStudioPanel();
+    DrawAnimationTimelinePanel();
     DrawLogicAndRuntimeHudPanel();
     DrawPlatzAiAndSpecialistPanel();
 
@@ -755,10 +968,11 @@ void StudioUiController::DrawProtectedTopMenuAndSecurityBar() {
         };
 
         drawWorkspaceTab("1. World", WorkspaceMode::WorldAndScene);
-        drawWorkspaceTab("2. 3D Mesh Lab", WorkspaceMode::ModelAndAssets);
-        drawWorkspaceTab("3. Material Graph", WorkspaceMode::MaterialsAndShaders);
-        drawWorkspaceTab("4. 2D Pixel Art", WorkspaceMode::PixelArtAndSprites);
-        drawWorkspaceTab("5. Logic & AI", WorkspaceMode::PlatzAiWorkbench);
+        drawWorkspaceTab("2. Mesh Lab", WorkspaceMode::ModelAndAssets);
+        drawWorkspaceTab("3. Materials", WorkspaceMode::MaterialsAndShaders);
+        drawWorkspaceTab("4. Pixel Art", WorkspaceMode::PixelArtAndSprites);
+        drawWorkspaceTab("5. Anim & Audio", WorkspaceMode::AnimationAndAudio);
+        drawWorkspaceTab("6. Logic & AI", WorkspaceMode::PlatzAiWorkbench);
 
         ImGui::Separator();
 
@@ -888,12 +1102,12 @@ void StudioUiController::DrawHierarchyAndStationsPanel() {
 
         ImGui::Separator();
 
-        // Jump to Validation Station Bar
+        // Jump to Validation Station Bar (9 cumulative stations)
         ImGui::TextDisabled("Living Validation World Stations (Click to Focus):");
-        const char* stationIds[] = {"ST-01", "ST-02", "ST-03", "ST-04", "ST-05", "ST-06", "ST-07", "ST-08"};
-        for (int i = 0; i < 8; ++i) {
-            if (i == 4) {
-                // Wrap to second row of 4 station pills
+        const char* stationIds[] = {"ST-01", "ST-02", "ST-03", "ST-04", "ST-05", "ST-06", "ST-07", "ST-08", "ST-09"};
+        for (int i = 0; i < 9; ++i) {
+            if (i == 5) {
+                // Wrap cleanly to second row
             } else if (i > 0) {
                 ImGui::SameLine();
             }
@@ -901,7 +1115,7 @@ void StudioUiController::DrawHierarchyAndStationsPanel() {
                 for (const auto& obj : GetActiveSceneObjects()) {
                     if (obj.logic.stationCategory == stationIds[i] && obj.mesh.primitiveType != "plane") {
                         SetSelectedObjectId(obj.id);
-                        camera_.FocusOnPoint(obj.transform.position, 5.8f);
+                        camera_.FocusOnPoint(obj.transform.position, 5.6f);
                         break;
                     }
                 }
@@ -937,6 +1151,8 @@ void StudioUiController::DrawHierarchyAndStationsPanel() {
                 ImGui::TableSetColumnIndex(1);
                 if (obj.light.enabled) {
                     ImGui::TextColored(ImVec4(1.0f, 0.88f, 0.35f, 1.0f), "Light");
+                } else if (obj.animation.enabled && obj.audio.enabled) {
+                    ImGui::TextColored(ImVec4(0.28f, 0.95f, 0.72f, 1.0f), "Anim+Aud");
                 } else if (!obj.mesh.modifierStack.empty()) {
                     ImGui::TextColored(ImVec4(0.0f, 0.90f, 1.0f, 1.0f), "ModStack");
                 } else if (obj.physics.isDynamic) {
@@ -1235,17 +1451,20 @@ void StudioUiController::Draw3DViewportPanel() {
             }
         }
 
-        // Bottom Status & Telemetry Footer inside 3D Viewport
+        // Bottom Status & Honest Per-Stage Telemetry Footer inside 3D Viewport
         const auto& perf = renderer_.GetPerfMetrics();
         auto budget = renderer_.GetContext().GetMemoryBudgetSnapshot();
         ImGui::TextColored(ImVec4(0.65f, 0.78f, 0.92f, 1.0f),
-            "%s (Vulkan %s)  |  Draws: %u  |  Triangles: %u  |  GPU Pass: %.3f ms  |  CPU Frame: %.2f ms  |  VMA Active: %.2f MB",
+            "%s | Draws:%u Tris:%u | GPU:%.3fms | CPU:%.2fms (UI:%.2f Rec:%.2f) | Wait:%.2fms [%s] | VMA:%.1fMB",
             renderer_.GetContext().GetCapabilities().deviceName.c_str(),
-            renderer_.GetContext().GetFormattedApiVersion().c_str(),
             perf.drawCallCount,
             perf.triangleCount,
             perf.gpuScenePassTimeMs,
-            perf.cpuFrameTimeMs,
+            perf.cpuActiveWorkMs,
+            perf.cpuUiBuildMs,
+            perf.cpuCommandRecordMs,
+            perf.cpuPresentWaitMs,
+            perf.presentModeName.c_str(),
             static_cast<double>(budget.activeAllocatedBytes) / (1024.0 * 1024.0));
     }
     ImGui::End();
@@ -1344,8 +1563,8 @@ void StudioUiController::DrawInspectorAndMaterialPanel() {
             }
         }
 
-        // 3. 3D Mesh & Non-Destructive Modifier Stack Section (PLZ-MODEL-001, PLZ-MODEL-005)
-        if (ImGui::CollapsingHeader("3. 3D Geometry & Non-Destructive Modifier Stack", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // 3. 3D Mesh & CPU-Evaluated Non-Destructive Modifier Stack Section (PLZ-MODEL-001, PLZ-MODEL-005)
+        if (ImGui::CollapsingHeader("3. 3D Geometry & CPU-Evaluated Modifiers (VMA Upload)", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (BeginPropertyTable("##tbl_mesh_mods", uiScale_)) {
                 BeginPropertyRow("Base Primitive", "Underlying parametric or imported content-addressed mesh");
                 const char* primTypes[] = {"cube", "sphere", "cylinder", "torus", "plane", "custom_asset"};
@@ -1358,7 +1577,7 @@ void StudioUiController::DrawInspectorAndMaterialPanel() {
                     changed = true;
                 }
 
-                BeginPropertyRow("Add Modifier", "Stack non-destructive operations evaluated live on GPU");
+                BeginPropertyRow("Add Modifier", "Non-destructive stack evaluated on CPU, then uploaded to Vulkan VMA device buffers on change");
                 if (ImGui::Button("+ Subdiv")) InvokeCommandById("model.subdivide");
                 ImGui::SameLine();
                 if (ImGui::Button("+ Twist")) InvokeCommandById("model.add_taper_twist");
@@ -1373,14 +1592,15 @@ void StudioUiController::DrawInspectorAndMaterialPanel() {
                     changed |= ImGui::Checkbox("##en", &mod.enabled);
                     ImGui::SameLine();
                     if (mod.modifierType == "TaperTwist") {
-                        ImGui::SetNextItemWidth(95.0f * uiScale_);
-                        changed |= ImGui::DragFloat("Twist", &mod.paramA, 1.0f, -180.0f, 180.0f, "%.0f deg");
+                        float halfW = std::max(54.0f, (ImGui::GetContentRegionAvail().x - 10.0f * uiScale_) * 0.48f);
+                        ImGui::SetNextItemWidth(halfW);
+                        changed |= ImGui::DragFloat("##tw", &mod.paramA, 1.0f, -180.0f, 180.0f, "Tw %.0f deg");
                         ImGui::SameLine();
-                        ImGui::SetNextItemWidth(85.0f * uiScale_);
-                        changed |= ImGui::DragFloat("Taper", &mod.paramB, 0.02f, 0.2f, 2.0f, "%.2f");
+                        ImGui::SetNextItemWidth(halfW);
+                        changed |= ImGui::DragFloat("##tp", &mod.paramB, 0.02f, 0.2f, 2.0f, "Tp %.2fx");
                     } else if (mod.modifierType == "BevelChamfer") {
-                        ImGui::SetNextItemWidth(110.0f * uiScale_);
-                        changed |= ImGui::SliderFloat("Chamfer", &mod.paramA, -0.3f, 0.3f, "%.2f");
+                        ImGui::SetNextItemWidth(-1.0f);
+                        changed |= ImGui::SliderFloat("##ch", &mod.paramA, -0.3f, 0.3f, "Chamfer %.2f");
                     } else {
                         ImGui::TextDisabled("4x Quad/Tri Subdivision");
                     }
@@ -1451,6 +1671,64 @@ void StudioUiController::DrawInspectorAndMaterialPanel() {
             }
         }
 
+        // 6. Spatial Audio & Procedural DSP Section (PLZ-AUDIO-001, N-15)
+        if (ImGui::CollapsingHeader("6. Spatial Audio & Procedural DSP", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (BeginPropertyTable("##tbl_audio", uiScale_)) {
+                BeginPropertyRow("Audio Emitter");
+                changed |= ImGui::Checkbox("Enabled##aud_en", &edited.audio.enabled);
+                ImGui::SameLine();
+                changed |= ImGui::Checkbox("3D Spatial##aud_3d", &edited.audio.spatial3D);
+
+                BeginPropertyRow("Procedural Cue");
+                const char* cueNames[] = {"CrystalChime", "PhysicsImpact", "TransferArp", "DronePulse", "UiClick"};
+                int curCueIdx = 0;
+                for (int i = 0; i < 5; ++i) {
+                    if (edited.audio.cueType == cueNames[i]) curCueIdx = i;
+                }
+                if (ImGui::Combo("##aud_cue", &curCueIdx, cueNames, 5)) {
+                    edited.audio.cueType = cueNames[curCueIdx];
+                    changed = true;
+                }
+
+                BeginPropertyRow("Volume & Pitch");
+                ImGui::SetNextItemWidth(95.0f * uiScale_);
+                changed |= ImGui::SliderFloat("Vol", &edited.audio.volume, 0.0f, 1.0f, "%.2f");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(95.0f * uiScale_);
+                changed |= ImGui::SliderFloat("Pitch", &edited.audio.pitch, 0.5f, 2.0f, "%.2fx");
+
+                BeginPropertyRow("Low-Pass Cutoff");
+                changed |= ImGui::SliderFloat("##aud_lpf", &edited.audio.lowPassCutoffHz, 400.0f, 18000.0f, "%.0f Hz");
+
+                BeginPropertyRow("Triggers");
+                changed |= ImGui::Checkbox("On Interact", &edited.audio.playOnInteract);
+                ImGui::SameLine();
+                changed |= ImGui::Checkbox("On Collision", &edited.audio.playOnCollision);
+
+                BeginPropertyRow("Audition Cue");
+                if (ImGui::Button("Test 3D Spatial Cue")) {
+                    if (audioEngine_ && audioEngine_->IsInitialized()) {
+                        platform::SpatialAudioCueRequest cue;
+                        cue.cueType = edited.audio.cueType;
+                        cue.sourceWorldPos = edited.transform.position;
+                        cue.volume = edited.audio.volume;
+                        cue.pitch = edited.audio.pitch;
+                        cue.maxDistance = edited.audio.maxDistance;
+                        cue.spatial3D = edited.audio.spatial3D;
+                        cue.lowPassCutoffHz = edited.audio.lowPassCutoffHz;
+                        glm::mat4 camV = camera_.GetViewMatrix();
+                        glm::vec3 listenerRight(camV[0][0], camV[1][0], camV[2][0]);
+                        audioEngine_->PlaySpatialCue(cue, camera_.GetEyePosition(), listenerRight);
+                        statusBannerMessage_ = "Triggered spatial audio cue '" + cue.cueType + "' from " + edited.name;
+                    } else {
+                        statusBannerMessage_ = "Spatial audio engine not initialized";
+                    }
+                }
+
+                ImGui::EndTable();
+            }
+        }
+
         if (changed) {
             edited.transform.Sanitize();
             if (runtime_.IsPlaying()) {
@@ -1465,7 +1743,7 @@ void StudioUiController::DrawInspectorAndMaterialPanel() {
 
 void StudioUiController::DrawAssetAndValidationWorldPanel() {
     if (ImGui::Begin("Asset Browser")) {
-        if (ImGui::Button("Run All 8 Validation World Stations (F9)")) {
+        if (ImGui::Button("Run All 9 Validation World Stations (F9)")) {
             InvokeCommandById("qa.run_validation_route");
         }
         ImGui::SameLine();
@@ -1523,33 +1801,75 @@ void StudioUiController::DrawAssetAndValidationWorldPanel() {
 
 void StudioUiController::DrawMaterialGraphAndSlangPanel() {
     if (ImGui::Begin("Material Node Graph")) {
-        if (ImGui::Button("Compile Graph to Slang 2026.22.1 & Hot-Reload Vulkan Pipeline")) {
+        const core::SceneObject* selObj = project_.FindObject(selectedObjectId_);
+        std::string targetLabel = selObj ? selObj->name : std::string("(No Object)");
+
+        if (ImGui::Button("Compile DAG -> Slang & Hot-Reload")) {
             InvokeCommandById("material.compile_graph_slang");
         }
         ImGui::SameLine();
-        if (ImGui::Button("Reset Default 4-Node PBR Graph")) {
+
+        auto addAndWireNode = [&](const char* type, glm::vec3 col, float a, float b) {
+            const auto* outNode = materialGraph_.FindNode("node_output");
+            std::string prevIn = (outNode && !outNode->inputNodeA.empty()) ? outNode->inputNodeA : std::string("node_albedo");
+            std::string inB = (std::string(type) == "BlendMix") ? std::string("node_albedo") : std::string();
+            std::string newId = materialGraph_.AddNode(type, col, a, b, prevIn, inB);
+            if (!newId.empty() && outNode) {
+                materialGraph_.ConnectNodes(newId, "node_output", 0);
+            }
+            selectedMatNodeId_ = newId;
+            CommitMaterialGraphToSelectedObject(std::string("Add Material Node: ") + type);
+        };
+
+        if (ImGui::Button("+ WaveBands")) addAndWireNode("WaveBands", {0.10f, 0.90f, 0.98f}, 6.0f, 0.25f);
+        ImGui::SameLine();
+        if (ImGui::Button("+ HeightGrad")) addAndWireNode("HeightGradient", {0.98f, 0.78f, 0.28f}, 0.55f, 0.6f);
+        ImGui::SameLine();
+        if (ImGui::Button("+ Noise")) addAndWireNode("NoisePattern", {0.75f, 0.85f, 0.95f}, 12.0f, 0.28f);
+        ImGui::SameLine();
+        if (ImGui::Button("+ BlendMix")) addAndWireNode("BlendMix", {0.20f, 0.85f, 0.95f}, 0.45f, 0.0f);
+        ImGui::SameLine();
+        if (ImGui::Button("Delete Node")) {
+            std::string err;
+            if (materialGraph_.RemoveNode(selectedMatNodeId_, &err)) {
+                selectedMatNodeId_ = materialGraph_.GetNodes().empty() ? "" : materialGraph_.GetNodes().front().nodeId;
+                CommitMaterialGraphToSelectedObject("Remove Material Node");
+            } else {
+                materialGraphDiagnostic_ = "[DELETE BLOCKED] " + err;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset 4-Node")) {
             materialGraph_.BuildDefaultProceduralGraph();
-            InvokeCommandById("material.compile_graph_slang");
+            selectedMatNodeId_ = "node_checker";
+            CommitMaterialGraphToSelectedObject("Reset Default 4-Node Material Graph");
         }
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.28f, 0.92f, 0.58f, 1.0f), "%s", materialGraphDiagnostic_.c_str());
+
+        auto dagVal = materialGraph_.ValidateGraph();
+        ImGui::TextColored(
+            dagVal.valid ? ImVec4(0.28f, 0.92f, 0.58f, 1.0f) : ImVec4(0.98f, 0.35f, 0.35f, 1.0f),
+            "Target: %s  |  DAG: %s (%zu nodes)  |  %s",
+            targetLabel.c_str(),
+            dagVal.valid ? "VALID" : "INVALID",
+            materialGraph_.GetNodes().size(),
+            materialGraphDiagnostic_.c_str());
 
         ImGui::Separator();
 
         if (ImGui::BeginTable("##mat_graph_split", 3, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable)) {
-            ImGui::TableSetupColumn("Visual Node Graph Canvas", ImGuiTableColumnFlags_WidthStretch, 0.48f);
-            ImGui::TableSetupColumn("Node Parameters & Live Preview", ImGuiTableColumnFlags_WidthStretch, 0.26f);
-            ImGui::TableSetupColumn("Generated Slang Shader Code", ImGuiTableColumnFlags_WidthStretch, 0.26f);
+            ImGui::TableSetupColumn("Expandable Material DAG Canvas (Click Node to Edit)", ImGuiTableColumnFlags_WidthStretch, 0.46f);
+            ImGui::TableSetupColumn("Selected Node Inspector & Preview", ImGuiTableColumnFlags_WidthStretch, 0.29f);
+            ImGui::TableSetupColumn("Compiled Slang 2026.22.1 Shader", ImGuiTableColumnFlags_WidthStretch, 0.25f);
 
             ImGui::TableNextRow();
 
-            // Column 0: Interactive Visual Node Graph Canvas with Bezier Wires (2x2 adaptive layout, clipped to column)
+            // Column 0: Interactive Topological DAG Canvas with Real Dual-Input Bezier Wires
             ImGui::TableSetColumnIndex(0);
             {
                 ImVec2 canvasMin = ImGui::GetCursorScreenPos();
                 ImVec2 canvasSz = ImGui::GetContentRegionAvail();
-                canvasSz.x = std::max(canvasSz.x, 180.0f * uiScale_);
-                canvasSz.y = std::max(canvasSz.y, 148.0f * uiScale_);
+                canvasSz.x = std::max(canvasSz.x, 220.0f * uiScale_);
+                canvasSz.y = std::max(canvasSz.y, 165.0f * uiScale_);
                 ImVec2 canvasMax(canvasMin.x + canvasSz.x, canvasMin.y + canvasSz.y);
 
                 ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1557,7 +1877,6 @@ void StudioUiController::DrawMaterialGraphAndSlangPanel() {
                 dl->AddRectFilled(canvasMin, canvasMax, IM_COL32(14, 17, 24, 255), 5.0f);
                 dl->AddRect(canvasMin, canvasMax, IM_COL32(45, 58, 82, 255), 5.0f);
 
-                // Subtle background grid
                 float gridStep = 22.0f * uiScale_;
                 for (float gx = gridStep; gx < canvasSz.x; gx += gridStep) {
                     dl->AddLine(ImVec2(canvasMin.x + gx, canvasMin.y), ImVec2(canvasMin.x + gx, canvasMax.y), IM_COL32(26, 32, 44, 180));
@@ -1567,84 +1886,164 @@ void StudioUiController::DrawMaterialGraphAndSlangPanel() {
                 }
 
                 const auto& nodes = materialGraph_.GetNodes();
-                float padX = 12.0f * uiScale_;
+                std::vector<std::string> orderedIds = dagVal.topologicalOrder;
+                if (orderedIds.size() != nodes.size()) {
+                    orderedIds.clear();
+                    for (const auto& n : nodes) orderedIds.push_back(n.nodeId);
+                }
+
+                size_t count = std::max<size_t>(1, orderedIds.size());
+                size_t cols = std::min<size_t>(3, std::max<size_t>(2, (count + 1) / 2));
+                size_t rows = (count + cols - 1) / cols;
+                float padX = 10.0f * uiScale_;
                 float padY = 10.0f * uiScale_;
-                float nodeW = std::clamp((canvasSz.x - padX * 3.2f) * 0.47f, 95.0f, 210.0f * uiScale_);
-                float nodeH = std::clamp((canvasSz.y - padY * 3.0f) * 0.45f, 46.0f, 72.0f * uiScale_);
+                float nodeW = std::clamp((canvasSz.x - padX * static_cast<float>(cols + 1)) / static_cast<float>(cols), 88.0f, 170.0f * uiScale_);
+                float nodeH = std::clamp((canvasSz.y - padY * static_cast<float>(rows + 1)) / static_cast<float>(rows), 44.0f, 64.0f * uiScale_);
 
-                std::vector<ImVec2> nodePositions;
-                for (size_t i = 0; i < nodes.size(); ++i) {
-                    size_t col = i / 2;
-                    size_t row = i % 2;
-                    float nx = canvasMin.x + padX + static_cast<float>(col) * (nodeW + padX * 1.4f);
+                std::map<std::string, ImVec2> nodeRectMin;
+                for (size_t i = 0; i < orderedIds.size(); ++i) {
+                    size_t col = i % cols;
+                    size_t row = i / cols;
+                    float nx = canvasMin.x + padX + static_cast<float>(col) * (nodeW + padX);
                     float ny = canvasMin.y + padY + static_cast<float>(row) * (nodeH + padY);
-                    nodePositions.push_back(ImVec2(nx, ny));
+                    nodeRectMin[orderedIds[i]] = ImVec2(nx, ny);
                 }
 
-                // Draw Bezier spline connections between sequential nodes
-                for (size_t i = 0; i + 1 < nodePositions.size(); ++i) {
-                    ImVec2 p1(nodePositions[i].x + nodeW * 0.5f, nodePositions[i].y + nodeH);
-                    ImVec2 p2(nodePositions[i + 1].x + nodeW * 0.5f, nodePositions[i + 1].y);
-                    if (i == 1) {
-                        p1 = ImVec2(nodePositions[i].x + nodeW, nodePositions[i].y + nodeH * 0.5f);
-                        p2 = ImVec2(nodePositions[i + 1].x, nodePositions[i + 1].y + nodeH * 0.5f);
-                    }
-                    dl->AddBezierCubic(
-                        p1,
-                        ImVec2((p1.x + p2.x) * 0.5f, p1.y),
-                        ImVec2((p1.x + p2.x) * 0.5f, p2.y),
-                        p2,
-                        IM_COL32(0, 212, 245, 235),
-                        2.4f * uiScale_);
+                // Draw real directed DAG Bezier wires (Input A = Cyan, Input B = Gold)
+                for (const auto& n : nodes) {
+                    auto dstIt = nodeRectMin.find(n.nodeId);
+                    if (dstIt == nodeRectMin.end()) continue;
+                    auto drawWire = [&](const std::string& srcId, bool isInputA) {
+                        if (srcId.empty()) return;
+                        auto srcIt = nodeRectMin.find(srcId);
+                        if (srcIt == nodeRectMin.end()) return;
+                        ImVec2 p1(srcIt->second.x + nodeW, srcIt->second.y + nodeH * 0.5f);
+                        ImVec2 p2(dstIt->second.x, dstIt->second.y + nodeH * (isInputA ? 0.38f : 0.72f));
+                        float midX = (p1.x + p2.x) * 0.5f;
+                        ImU32 wireCol = isInputA ? IM_COL32(0, 212, 245, 235) : IM_COL32(248, 196, 62, 235);
+                        dl->AddBezierCubic(p1, ImVec2(midX, p1.y), ImVec2(midX, p2.y), p2, wireCol, 2.2f * uiScale_);
+                        dl->AddCircleFilled(p2, 3.5f * uiScale_, wireCol);
+                    };
+                    drawWire(n.inputNodeA, true);
+                    drawWire(n.inputNodeB, false);
                 }
 
-                // Draw Node Cards
-                for (size_t i = 0; i < nodes.size(); ++i) {
-                    const auto& n = nodes[i];
-                    ImVec2 pMin = nodePositions[i];
+                // Draw clickable Node Cards
+                ImGuiIO& io = ImGui::GetIO();
+                for (const auto& id : orderedIds) {
+                    const auto* n = materialGraph_.FindNode(id);
+                    if (!n) continue;
+                    ImVec2 pMin = nodeRectMin[id];
                     ImVec2 pMax(pMin.x + nodeW, pMin.y + nodeH);
-                    dl->AddRectFilled(pMin, pMax, IM_COL32(26, 33, 46, 248), 5.0f);
-                    dl->AddRectFilled(pMin, ImVec2(pMax.x, pMin.y + 20.0f * uiScale_), IM_COL32(0, 148, 196, 235), 5.0f);
-                    dl->AddRect(pMin, pMax, IM_COL32(75, 105, 145, 255), 5.0f);
-                    dl->AddText(ImVec2(pMin.x + 6.0f, pMin.y + 2.0f), IM_COL32(255, 255, 255, 255), n.nodeType.c_str());
+                    bool isSel = (n->nodeId == selectedMatNodeId_);
+                    ImU32 hdrCol = (n->nodeType == "PbrOutput")
+                        ? IM_COL32(28, 152, 92, 238)
+                        : (isSel ? IM_COL32(0, 182, 232, 250) : IM_COL32(28, 92, 136, 230));
+                    ImU32 borderCol = isSel ? IM_COL32(255, 224, 92, 255) : IM_COL32(75, 105, 145, 255);
+
+                    dl->AddRectFilled(pMin, pMax, IM_COL32(24, 31, 44, 248), 5.0f);
+                    dl->AddRectFilled(pMin, ImVec2(pMax.x, pMin.y + 20.0f * uiScale_), hdrCol, 5.0f);
+                    dl->AddRect(pMin, pMax, borderCol, 5.0f, 0, isSel ? 2.2f : 1.0f);
+
+                    // Clip text cleanly inside each node card so High-DPI scaling never overflows across nodes
+                    dl->PushClipRect(ImVec2(pMin.x + 2.0f, pMin.y + 1.0f), ImVec2(pMax.x - 3.0f, pMax.y - 2.0f), true);
+                    dl->AddText(ImVec2(pMin.x + 6.0f, pMin.y + 2.0f), IM_COL32(255, 255, 255, 255), n->nodeType.c_str());
 
                     char paramLine[64]{};
-                    std::snprintf(paramLine, sizeof(paramLine), "A: %.2f  B: %.2f", n.scalarA, n.scalarB);
-                    dl->AddText(ImVec2(pMin.x + 6.0f, pMin.y + 24.0f * uiScale_), IM_COL32(200, 215, 235, 255), paramLine);
+                    std::snprintf(paramLine, sizeof(paramLine), "A:%.2f  B:%.2f", n->scalarA, n->scalarB);
+                    dl->AddText(ImVec2(pMin.x + 6.0f, pMin.y + 24.0f * uiScale_), IM_COL32(196, 212, 232, 255), paramLine);
+                    dl->PopClipRect();
+
+                    if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                        io.MousePos.x >= pMin.x && io.MousePos.x <= pMax.x &&
+                        io.MousePos.y >= pMin.y && io.MousePos.y <= pMax.y) {
+                        selectedMatNodeId_ = n->nodeId;
+                    }
                 }
 
                 dl->PopClipRect();
                 ImGui::Dummy(canvasSz);
             }
 
-            // Column 1: Node Parameter Sliders & Baked 2D Texture Preview
+            // Column 1: Selected Node Wiring & Parameters + Live Baked 128x128 Preview
             ImGui::TableSetColumnIndex(1);
             {
                 VkDescriptorSet graphTex = renderer_.GetMaterialGraphImGuiDescriptorSet();
                 if (graphTex != VK_NULL_HANDLE) {
-                    ImGui::Image(reinterpret_cast<ImTextureID>(graphTex), ImVec2(54.0f * uiScale_, 54.0f * uiScale_));
+                    ImGui::Image(reinterpret_cast<ImTextureID>(graphTex), ImVec2(56.0f * uiScale_, 56.0f * uiScale_));
                     ImGui::SameLine();
-                    ImGui::TextWrapped("Live Procedural PBR Preview\n(128x128 RGBA8)");
+                    ImGui::BeginGroup();
+                    ImGui::TextColored(ImVec4(0.0f, 0.88f, 1.0f, 1.0f), "Live DAG Texture");
+                    ImGui::TextDisabled("128x128 CPU Preview\n+ Slang SPIR-V 1.5");
+                    ImGui::EndGroup();
                 }
-                for (auto& n : materialGraph_.GetNodesMutable()) {
-                    ImGui::PushID(n.nodeId.c_str());
-                    if (n.nodeType == "CheckerPattern") {
-                        ImGui::SetNextItemWidth(115.0f * uiScale_);
-                        ImGui::SliderFloat("UV Scale", &n.scalarA, 2.0f, 24.0f, "%.1f");
-                    } else if (n.nodeType == "FresnelRim") {
-                        ImGui::SetNextItemWidth(115.0f * uiScale_);
-                        ImGui::SliderFloat("Rim Exp", &n.scalarA, 1.0f, 6.0f, "%.2f");
+
+                if (auto* selNode = materialGraph_.FindNode(selectedMatNodeId_)) {
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(1.0f, 0.86f, 0.35f, 1.0f), "Node: %s (%s)",
+                        selNode->nodeId.c_str(), selNode->nodeType.c_str());
+
+                    bool nodeEdited = false;
+                    // Validated Input A / Input B rewiring dropdowns
+                    if (selNode->nodeType != "AlbedoColor") {
+                        auto drawInputCombo = [&](const char* label, std::string& curIn, int portIdx) {
+                            ImGui::SetNextItemWidth(135.0f * uiScale_);
+                            if (ImGui::BeginCombo(label, curIn.empty() ? "(None)" : curIn.c_str())) {
+                                if (portIdx == 1 && ImGui::Selectable("(None)", curIn.empty())) {
+                                    curIn.clear();
+                                    CommitMaterialGraphToSelectedObject("Disconnect Material Node Port B");
+                                }
+                                for (const auto& cand : materialGraph_.GetNodes()) {
+                                    if (cand.nodeId == selNode->nodeId || cand.nodeType == "PbrOutput") continue;
+                                    bool isCur = (cand.nodeId == curIn);
+                                    std::string itemLbl = cand.nodeId + " (" + cand.nodeType + ")";
+                                    if (ImGui::Selectable(itemLbl.c_str(), isCur)) {
+                                        std::string err;
+                                        if (materialGraph_.ConnectNodes(cand.nodeId, selNode->nodeId, portIdx, &err)) {
+                                            CommitMaterialGraphToSelectedObject("Rewire Material DAG");
+                                        } else {
+                                            materialGraphDiagnostic_ = "[CYCLE/WIRE BLOCKED] " + err;
+                                        }
+                                    }
+                                }
+                                ImGui::EndCombo();
+                            }
+                        };
+                        drawInputCombo("Input A", selNode->inputNodeA, 0);
+                        if (selNode->nodeType == "BlendMix") {
+                            drawInputCombo("Input B", selNode->inputNodeB, 1);
+                        }
                     }
-                    ImGui::PopID();
+
+                    if (selNode->nodeType == "AlbedoColor" || selNode->nodeType == "FresnelRim" ||
+                        selNode->nodeType == "HeightGradient" || selNode->nodeType == "WaveBands" ||
+                        selNode->nodeType == "CheckerPattern" || selNode->nodeType == "NoisePattern") {
+                        ImGui::SetNextItemWidth(145.0f * uiScale_);
+                        nodeEdited |= ImGui::ColorEdit3("Color##mg_col", &selNode->colorParam.x);
+                    }
+                    if (selNode->nodeType != "PbrOutput") {
+                        ImGui::SetNextItemWidth(135.0f * uiScale_);
+                        nodeEdited |= ImGui::SliderFloat("Param A##mg_a", &selNode->scalarA, 0.0f, 24.0f, "%.2f");
+                        ImGui::SetNextItemWidth(135.0f * uiScale_);
+                        nodeEdited |= ImGui::SliderFloat("Param B##mg_b", &selNode->scalarB, 0.0f, 1.0f, "%.2f");
+                    }
+
+                    if (nodeEdited && ImGui::IsItemDeactivatedAfterEdit()) {
+                        CommitMaterialGraphToSelectedObject("Adjust Material Node Parameters");
+                    } else if (nodeEdited && renderer_.IsInitialized()) {
+                        renderer_.UpdateMaterialGraphPreviewTexture(materialGraph_.BakeGraphAlbedoTexture(128, 128));
+                    }
                 }
             }
 
-            // Column 2: Generated Slang 2026.22.1 Source Code Inspection
+            // Column 2: Generated Slang 2026.22.1 Topological Shader Code Inspection
             ImGui::TableSetColumnIndex(2);
             {
+                ImGui::BeginChild("##slang_code_scroll", ImVec2(0.0f, 160.0f * uiScale_), false);
                 if (ImFont* mono = renderer_.GetFontMono()) ImGui::PushFont(mono);
-                ImGui::TextWrapped("%s", lastCompiledSlangPreview_.substr(0, 520).c_str());
+                ImGui::TextWrapped("%s", lastCompiledSlangPreview_.c_str());
                 if (renderer_.GetFontMono()) ImGui::PopFont();
+                ImGui::EndChild();
             }
 
             ImGui::EndTable();
@@ -1655,71 +2054,299 @@ void StudioUiController::DrawMaterialGraphAndSlangPanel() {
 
 void StudioUiController::DrawPixelArtAndSpriteStudioPanel() {
     if (ImGui::Begin("2D Pixel & Sprite Studio")) {
-        if (ImGui::Button("Bake Sprite to Content-Addressed Store & Apply to Selected 3D Object")) {
+        const core::SceneObject* selObj = project_.FindObject(selectedObjectId_);
+        if (ImGui::Button("Bake & Bind Live Texture to 3D Object")) {
             InvokeCommandById("pixel.apply_sprite_to_object");
         }
         ImGui::SameLine();
-        ImGui::Checkbox("Mirror-X Symmetry", &pixelMirrorSymmetry_);
+        if (ImGui::RadioButton("Brush", pixelToolMode_ == 0)) pixelToolMode_ = 0;
         ImGui::SameLine();
-        if (ImGui::Button("Stamp Tile Grid")) {
+        if (ImGui::RadioButton("Eraser", pixelToolMode_ == 1)) pixelToolMode_ = 1;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Fill", pixelToolMode_ == 2)) pixelToolMode_ = 2;
+        ImGui::SameLine();
+        ImGui::Checkbox("Mirror-X", &pixelMirrorSymmetry_);
+        ImGui::SameLine();
+        if (ImGui::Button("Stamp Tile")) {
             pixelCanvas_.StampTilePattern(activePixelPaletteIdx_, 0);
-            if (renderer_.IsInitialized()) renderer_.UpdatePixelArtPreviewTexture(pixelCanvas_.BakeToImageData2D());
+            CommitPixelCanvasToSelectedObject("Stamp Pixel Tile Pattern");
         }
         ImGui::SameLine();
-        if (ImGui::Button("Reset PZ Crystal Emblem")) {
+        if (ImGui::Button("Reset Emblem")) {
             pixelCanvas_.InitializeDefaultPaletteAndEmblem();
-            if (renderer_.IsInitialized()) renderer_.UpdatePixelArtPreviewTexture(pixelCanvas_.BakeToImageData2D());
+            CommitPixelCanvasToSelectedObject("Reset 2-Layer PZ Emblem");
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Undo") && project_.CanUndo()) InvokeCommandById("edit.undo");
+        ImGui::SameLine();
+        if (ImGui::Button("Redo") && project_.CanRedo()) InvokeCommandById("edit.redo");
 
         ImGui::Separator();
 
-        // Palette Swatches
-        ImGui::TextUnformatted("Indexed Palette:");
-        for (size_t p = 0; p < pixelCanvas_.palette.size(); ++p) {
-            ImGui::SameLine();
-            ImGui::PushID(static_cast<int>(p));
-            const auto& c = pixelCanvas_.palette[p];
-            ImVec4 col(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, 1.0f);
-            if (ImGui::ColorButton("##pal_btn", col, ImGuiColorEditFlags_NoTooltip, ImVec2(22.0f * uiScale_, 22.0f * uiScale_))) {
-                activePixelPaletteIdx_ = static_cast<uint8_t>(p);
+        if (ImGui::BeginTable("##pixel_studio_layout", 3, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable)) {
+            ImGui::TableSetupColumn("Multi-Layer Stack", ImGuiTableColumnFlags_WidthFixed, 195.0f * uiScale_);
+            ImGui::TableSetupColumn("Interactive 16x16 Indexed Canvas", ImGuiTableColumnFlags_WidthStretch, 0.55f);
+            ImGui::TableSetupColumn("Live VK_FILTER_NEAREST Preview", ImGuiTableColumnFlags_WidthStretch, 0.45f);
+            ImGui::TableNextRow();
+
+            // Column 0: Non-Destructive Multi-Layer Stack
+            ImGui::TableSetColumnIndex(0);
+            {
+                if (ImGui::Button("+ Add Layer")) {
+                    pixelCanvas_.AddLayer("Layer " + std::to_string(pixelCanvas_.layers.size() + 1));
+                    CommitPixelCanvasToSelectedObject("Add Pixel-Art Layer");
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Remove") && pixelCanvas_.layers.size() > 1) {
+                    if (pixelCanvas_.RemoveLayer(pixelCanvas_.activeLayerIndex)) {
+                        CommitPixelCanvasToSelectedObject("Remove Pixel-Art Layer");
+                    }
+                }
+                ImGui::Separator();
+                for (size_t li = 0; li < pixelCanvas_.layers.size(); ++li) {
+                    ImGui::PushID(static_cast<int>(li));
+                    auto& layer = pixelCanvas_.layers[li];
+                    if (ImGui::Checkbox("##vis", &layer.visible)) {
+                        CommitPixelCanvasToSelectedObject("Toggle Pixel Layer Visibility");
+                    }
+                    ImGui::SameLine();
+                    bool isAct = (li == pixelCanvas_.activeLayerIndex);
+                    if (ImGui::Selectable(layer.layerName.c_str(), isAct)) {
+                        pixelCanvas_.activeLayerIndex = static_cast<uint32_t>(li);
+                    }
+                    ImGui::PopID();
+                }
             }
-            ImGui::PopID();
-        }
 
-        // Interactive 16x16 Pixel Grid + Nearest-Neighbor Magnified GPU Preview
-        ImVec2 gridOrigin = ImGui::GetCursorScreenPos();
-        float cellSz = 11.0f * uiScale_;
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImGuiIO& io = ImGui::GetIO();
+            // Column 1: Palette Swatches + Interactive 16x16 Grid with Undoable Stroke Capture
+            ImGui::TableSetColumnIndex(1);
+            {
+                ImGui::TextUnformatted("Palette:");
+                for (size_t p = 0; p < pixelCanvas_.palette.size(); ++p) {
+                    ImGui::SameLine();
+                    ImGui::PushID(static_cast<int>(p));
+                    const auto& c = pixelCanvas_.palette[p];
+                    ImVec4 col(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, 1.0f);
+                    if (ImGui::ColorButton("##pal_btn", col, ImGuiColorEditFlags_NoTooltip, ImVec2(20.0f * uiScale_, 20.0f * uiScale_))) {
+                        activePixelPaletteIdx_ = static_cast<uint8_t>(p);
+                        if (pixelToolMode_ == 1) pixelToolMode_ = 0;
+                    }
+                    ImGui::PopID();
+                }
 
-        for (uint32_t y = 0; y < pixelCanvas_.height; ++y) {
-            for (uint32_t x = 0; x < pixelCanvas_.width; ++x) {
-                ImVec2 pMin(gridOrigin.x + x * cellSz, gridOrigin.y + y * cellSz);
-                ImVec2 pMax(pMin.x + cellSz - 1.0f, pMin.y + cellSz - 1.0f);
-                uint8_t idx = pixelCanvas_.GetIndex(x, y);
-                const auto& c = pixelCanvas_.palette[idx % pixelCanvas_.palette.size()];
-                dl->AddRectFilled(pMin, pMax, IM_COL32(c.r, c.g, c.b, 255));
+                ImVec2 gridOrigin = ImGui::GetCursorScreenPos();
+                float cellSz = 10.5f * uiScale_;
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                ImGuiIO& io = ImGui::GetIO();
 
-                if (ImGui::IsWindowHovered() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                    if (io.MousePos.x >= pMin.x && io.MousePos.x <= pMax.x &&
-                        io.MousePos.y >= pMin.y && io.MousePos.y <= pMax.y) {
-                        pixelCanvas_.SetIndex(x, y, activePixelPaletteIdx_, pixelMirrorSymmetry_);
-                        if (renderer_.IsInitialized()) {
-                            renderer_.UpdatePixelArtPreviewTexture(pixelCanvas_.BakeToImageData2D());
+                auto composited = pixelCanvas_.BakeToImageData2D();
+                for (uint32_t y = 0; y < pixelCanvas_.height; ++y) {
+                    for (uint32_t x = 0; x < pixelCanvas_.width; ++x) {
+                        ImVec2 pMin(gridOrigin.x + x * cellSz, gridOrigin.y + y * cellSz);
+                        ImVec2 pMax(pMin.x + cellSz - 1.0f, pMin.y + cellSz - 1.0f);
+                        size_t pxOff = (static_cast<size_t>(y) * pixelCanvas_.width + x) * 4;
+                        dl->AddRectFilled(
+                            pMin,
+                            pMax,
+                            IM_COL32(composited.rgbaPixels[pxOff + 0], composited.rgbaPixels[pxOff + 1], composited.rgbaPixels[pxOff + 2], 255));
+
+                        if (ImGui::IsWindowHovered() && ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+                            io.MousePos.x >= pMin.x && io.MousePos.x <= pMax.x &&
+                            io.MousePos.y >= pMin.y && io.MousePos.y <= pMax.y) {
+                            if (pixelToolMode_ == 2) {
+                                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                                    pixelCanvas_.FloodFill(x, y, activePixelPaletteIdx_);
+                                    CommitPixelCanvasToSelectedObject("Flood Fill Pixel Layer");
+                                }
+                            } else {
+                                if (!pixelStrokeInProgress_) {
+                                    pixelStrokeInProgress_ = true;
+                                    pixelPreStrokeJson_ = selObj ? selObj->material.pixelCanvasJson : "";
+                                }
+                                if (pixelToolMode_ == 1) {
+                                    pixelCanvas_.ErasePixel(x, y, pixelMirrorSymmetry_);
+                                } else {
+                                    pixelCanvas_.SetIndex(x, y, activePixelPaletteIdx_, pixelMirrorSymmetry_);
+                                }
+                                if (renderer_.IsInitialized()) {
+                                    renderer_.UpdatePixelArtPreviewTexture(pixelCanvas_.BakeToImageData2D());
+                                }
+                            }
                         }
                     }
+                }
+                if (pixelStrokeInProgress_ && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    pixelStrokeInProgress_ = false;
+                    CommitPixelCanvasToSelectedObject("Paint Pixel-Art Stroke");
+                }
+                ImGui::Dummy(ImVec2(pixelCanvas_.width * cellSz + 6.0f, pixelCanvas_.height * cellSz));
+            }
+
+            // Column 2: Nearest-Neighbor Magnified Preview + Editable Lineage Info
+            ImGui::TableSetColumnIndex(2);
+            {
+                VkDescriptorSet pixTex = renderer_.GetPixelArtImGuiDescriptorSet();
+                if (pixTex != VK_NULL_HANDLE) {
+                    ImGui::Image(reinterpret_cast<ImTextureID>(pixTex), ImVec2(118.0f * uiScale_, 118.0f * uiScale_));
+                    ImGui::SameLine();
+                }
+                ImGui::BeginGroup();
+                ImGui::TextColored(ImVec4(0.0f, 0.88f, 1.0f, 1.0f), "Target: %s", selObj ? selObj->name.c_str() : "(None)");
+                ImGui::TextDisabled("Layers: %zu (Editable Source Preserved)", pixelCanvas_.layers.size());
+                ImGui::TextDisabled("Filter: VK_FILTER_NEAREST (N-14)");
+                if (selObj) {
+                    ImGui::TextDisabled("Source Asset: %s", selObj->material.pixelSourceAssetId ? core::FormatAssetId(selObj->material.pixelSourceAssetId).c_str() : "Inline JSON");
+                    ImGui::TextDisabled("3D Texture:   %s", selObj->material.albedoTextureAssetId ? core::FormatAssetId(selObj->material.albedoTextureAssetId).c_str() : "Unbound");
+                }
+                ImGui::EndGroup();
+            }
+
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+}
+
+void StudioUiController::DrawAnimationTimelinePanel() {
+    if (ImGui::Begin("Animation Timeline")) {
+        core::SceneObject* sel = runtime_.IsPlaying()
+            ? runtime_.FindRuntimeObject(selectedObjectId_)
+            : project_.FindObject(selectedObjectId_);
+        if (!sel) {
+            ImGui::TextDisabled("Select an object to author or preview keyframed Animation Timeline tracks.");
+            ImGui::End();
+            return;
+        }
+
+        core::SceneObject edited = *sel;
+        bool animChanged = false;
+
+        if (ImGui::Button(animPreviewPlaying_ ? "Pause Preview" : "Play Preview")) {
+            animPreviewPlaying_ = !animPreviewPlaying_;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset 0.0s")) {
+            animPreviewPlaying_ = false;
+            animPreviewTimeSec_ = 0.0f;
+        }
+        ImGui::SameLine();
+        animChanged |= ImGui::Checkbox("Anim Enabled", &edited.animation.enabled);
+        ImGui::SameLine();
+        animChanged |= ImGui::Checkbox("Loop", &edited.animation.loop);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(76.0f * uiScale_);
+        animChanged |= ImGui::DragFloat("Dur(s)", &edited.animation.durationSec, 0.1f, 0.5f, 30.0f, "%.1fs");
+        ImGui::SameLine();
+
+        const char* interpModes[] = {"EaseInOut", "Linear", "Step"};
+        ImGui::SetNextItemWidth(98.0f * uiScale_);
+        ImGui::Combo("Curve", &animKeyframeInterpIdx_, interpModes, 3);
+        ImGui::SameLine();
+
+        auto upsertKeyframe = [&](const std::string& propPath, const glm::vec3& val) {
+            edited.animation.enabled = true;
+            core::AnimationTrack* tr = nullptr;
+            for (auto& existing : edited.animation.tracks) {
+                if (existing.targetProperty == propPath) {
+                    tr = &existing;
+                    break;
+                }
+            }
+            if (!tr) {
+                core::AnimationTrack newTr;
+                newTr.trackId = "track_" + propPath;
+                newTr.targetProperty = propPath;
+                edited.animation.tracks.push_back(std::move(newTr));
+                tr = &edited.animation.tracks.back();
+            }
+            bool replaced = false;
+            for (auto& kf : tr->keyframes) {
+                if (std::abs(kf.timeSec - animPreviewTimeSec_) < 0.04f) {
+                    kf.value = val;
+                    kf.interpolation = interpModes[animKeyframeInterpIdx_];
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                tr->keyframes.push_back({animPreviewTimeSec_, val, interpModes[animKeyframeInterpIdx_]});
+                std::sort(tr->keyframes.begin(), tr->keyframes.end(),
+                    [](const core::AnimationKeyframe& a, const core::AnimationKeyframe& b) {
+                        return a.timeSec < b.timeSec;
+                    });
+            }
+            animChanged = true;
+        };
+
+        if (ImGui::Button("+ Keyframe Transform")) {
+            upsertKeyframe("position", edited.transform.position);
+            upsertKeyframe("rotationEulerDeg", edited.transform.rotationEulerDeg);
+            upsertKeyframe("scale", edited.transform.scale);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("+ Keyframe Emissive")) {
+            upsertKeyframe("emissiveStrength", {edited.material.emissiveStrength, 0.0f, 0.0f});
+        }
+
+        float dur = std::max(0.5f, edited.animation.durationSec);
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat("##anim_scrub", &animPreviewTimeSec_, 0.0f, dur, "Playhead: %.2fs");
+
+        // Visual Multi-Track Keyframe Timeline Canvas
+        ImVec2 tlMin = ImGui::GetCursorScreenPos();
+        ImVec2 tlSz = ImGui::GetContentRegionAvail();
+        tlSz.x = std::max(tlSz.x, 300.0f * uiScale_);
+        tlSz.y = std::max(tlSz.y, 118.0f * uiScale_);
+        ImVec2 tlMax(tlMin.x + tlSz.x, tlMin.y + tlSz.y);
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->PushClipRect(tlMin, tlMax, true);
+        dl->AddRectFilled(tlMin, tlMax, IM_COL32(14, 18, 26, 255), 4.0f);
+        dl->AddRect(tlMin, tlMax, IM_COL32(48, 62, 86, 255), 4.0f);
+
+        float labelColW = 148.0f * uiScale_;
+        float trackAreaW = std::max(80.0f, tlSz.x - labelColW - 14.0f);
+        dl->AddLine(ImVec2(tlMin.x + labelColW, tlMin.y), ImVec2(tlMin.x + labelColW, tlMax.y), IM_COL32(60, 76, 104, 255));
+
+        const char* trackNames[4] = {"position", "rotationEulerDeg", "scale", "emissiveStrength"};
+        float laneH = std::max(24.0f * uiScale_, tlSz.y / 4.0f);
+        for (int tIdx = 0; tIdx < 4; ++tIdx) {
+            float ly0 = tlMin.y + tIdx * laneH;
+            float lyMid = ly0 + laneH * 0.5f;
+            if (tIdx % 2 == 1) {
+                dl->AddRectFilled(ImVec2(tlMin.x + 1, ly0), ImVec2(tlMax.x - 1, ly0 + laneH), IM_COL32(20, 26, 38, 175));
+            }
+            dl->AddText(ImVec2(tlMin.x + 8.0f, lyMid - 7.0f * uiScale_), IM_COL32(210, 224, 240, 255), trackNames[tIdx]);
+
+            for (const auto& tr : edited.animation.tracks) {
+                if (tr.targetProperty != trackNames[tIdx]) continue;
+                for (const auto& kf : tr.keyframes) {
+                    float frac = std::clamp(kf.timeSec / dur, 0.0f, 1.0f);
+                    float kx = tlMin.x + labelColW + 6.0f + frac * (trackAreaW - 12.0f);
+                    float r = 6.0f * uiScale_;
+                    ImU32 kCol = (kf.interpolation == "EaseInOut")
+                        ? IM_COL32(0, 220, 250, 255)
+                        : (kf.interpolation == "Step" ? IM_COL32(250, 128, 86, 255) : IM_COL32(248, 206, 72, 255));
+                    ImVec2 diamond[4] = {
+                        {kx, lyMid - r},
+                        {kx + r, lyMid},
+                        {kx, lyMid + r},
+                        {kx - r, lyMid}
+                    };
+                    dl->AddConvexPolyFilled(diamond, 4, kCol);
+                    dl->AddPolyline(diamond, 4, IM_COL32(15, 20, 28, 255), ImDrawFlags_Closed, 1.2f);
                 }
             }
         }
 
-        ImGui::Dummy(ImVec2(pixelCanvas_.width * cellSz + 12.0f, pixelCanvas_.height * cellSz));
-        ImGui::SameLine();
-        VkDescriptorSet pixTex = renderer_.GetPixelArtImGuiDescriptorSet();
-        if (pixTex != VK_NULL_HANDLE) {
-            ImGui::BeginGroup();
-            ImGui::TextDisabled("VK_FILTER_NEAREST Exact Preview (N-14):");
-            ImGui::Image(reinterpret_cast<ImTextureID>(pixTex), ImVec2(128.0f * uiScale_, 128.0f * uiScale_));
-            ImGui::EndGroup();
+        // Playhead Needle
+        float phX = tlMin.x + labelColW + 6.0f + std::clamp(animPreviewTimeSec_ / dur, 0.0f, 1.0f) * (trackAreaW - 12.0f);
+        dl->AddLine(ImVec2(phX, tlMin.y), ImVec2(phX, tlMax.y), IM_COL32(255, 86, 98, 240), 2.2f * uiScale_);
+        dl->PopClipRect();
+        ImGui::Dummy(tlSz);
+
+        if (animChanged && !runtime_.IsPlaying()) {
+            project_.ApplyObjectMutation(sel->id, edited, "Edit Animation Timeline on " + sel->name, "Animation", "User");
         }
     }
     ImGui::End();
@@ -1842,35 +2469,27 @@ void StudioUiController::DrawPlatzAiAndSpecialistPanel() {
 
         if (ImGui::BeginTable("##specialist_table", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
             ImGui::TableSetupColumn("Original Local Specialist Model", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Architecture", ImGuiTableColumnFlags_WidthFixed, 120.0f * uiScale_);
-            ImGui::TableSetupColumn("Holdout MSE Reduction", ImGuiTableColumnFlags_WidthFixed, 175.0f * uiScale_);
-            ImGui::TableSetupColumn("Holdout Accuracy", ImGuiTableColumnFlags_WidthFixed, 125.0f * uiScale_);
-            ImGui::TableSetupColumn("Latency & Status", ImGuiTableColumnFlags_WidthFixed, 195.0f * uiScale_);
+            ImGui::TableSetupColumn("Holdout MSE vs Baseline", ImGuiTableColumnFlags_WidthFixed, 205.0f * uiScale_);
+            ImGui::TableSetupColumn("Measured Accuracy / MAE", ImGuiTableColumnFlags_WidthFixed, 175.0f * uiScale_);
+            ImGui::TableSetupColumn("Held-Out R^2", ImGuiTableColumnFlags_WidthFixed, 95.0f * uiScale_);
+            ImGui::TableSetupColumn("Timed Latency & Status", ImGuiTableColumnFlags_WidthFixed, 215.0f * uiScale_);
             ImGui::TableHeadersRow();
 
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextColored(ImVec4(0.0f, 0.88f, 1.0f, 1.0f), "1. %s", matRec.experimentName.c_str());
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted("12x24x7 MLP");
-            ImGui::TableSetColumnIndex(2);
-            ImGui::Text("%.5f -> %.5f", matRec.initialHoldoutMse, matRec.finalHoldoutMse);
-            ImGui::TableSetColumnIndex(3);
-            ImGui::TextColored(ImVec4(0.28f, 0.95f, 0.58f, 1.0f), "%.1f%% (%zu holdout)", matRec.holdoutAccuracyPct, matRec.holdoutSampleCount);
-            ImGui::TableSetColumnIndex(4);
-            ImGui::Text("%.2f us · %s", matRec.avgInferenceLatencyUs, matRec.qualificationStatus.c_str());
-
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextColored(ImVec4(0.0f, 0.88f, 1.0f, 1.0f), "2. %s", gpRec.experimentName.c_str());
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted("10x20x5 MLP");
-            ImGui::TableSetColumnIndex(2);
-            ImGui::Text("%.5f -> %.5f", gpRec.initialHoldoutMse, gpRec.finalHoldoutMse);
-            ImGui::TableSetColumnIndex(3);
-            ImGui::TextColored(ImVec4(0.28f, 0.95f, 0.58f, 1.0f), "%.1f%% (%zu holdout)", gpRec.holdoutAccuracyPct, gpRec.holdoutSampleCount);
-            ImGui::TableSetColumnIndex(4);
-            ImGui::Text("%.2f us · %s", gpRec.avgInferenceLatencyUs, gpRec.qualificationStatus.c_str());
+            auto drawModelRow = [&](int idx, const ai::SpecialistTrialReceipt& r) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextColored(ImVec4(0.0f, 0.88f, 1.0f, 1.0f), "%d. %s", idx, r.experimentName.c_str());
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%.5f (base %.4f, -%.1f%%)", r.finalHoldoutMse, r.baselineHoldoutMse, r.mseReductionOverBaselinePct);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextColored(ImVec4(0.28f, 0.95f, 0.58f, 1.0f), "%.1f%% | MAE %.4f", r.holdoutAccuracyPct, r.holdoutMae);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("%.4f", r.holdoutRSquared);
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("%.3f us (%ux) · %s", r.avgInferenceLatencyUs, r.inferenceTimingPasses, r.qualificationStatus.c_str());
+            };
+            drawModelRow(1, matRec);
+            drawModelRow(2, gpRec);
 
             ImGui::EndTable();
         }

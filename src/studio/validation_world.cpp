@@ -7,6 +7,7 @@
 #include "creative/texture_generator.h"
 #include "engine/runtime/runtime_session.h"
 #include "engine/scene/render_scene.h"
+#include "platform/audio_engine.h"
 
 namespace platz::studio {
 
@@ -266,13 +267,16 @@ void PopulateStationObjects(core::ProjectState& project, const std::string& filt
     }
 
     if (shouldBuild("ST-07")) {
-        // Gate 4 Station 7: Non-Destructive 3D Modifier Stack + Visual Material Graph -> Slang Hot-Reload
+        // Gate 4 Station 7: CPU-Evaluated Non-Destructive 3D Modifier Stack (uploaded to Vulkan VMA) + 5-Node DAG Material Graph -> Slang Hot-Reload
         creative::MaterialGraphDocument matGraph;
+        std::string waveId = matGraph.AddNode("WaveBands", {0.10f, 0.90f, 0.98f}, 7.0f, 0.25f, "node_albedo");
+        matGraph.ConnectNodes(waveId, "node_checker", 0);
+
         core::ObjectId spireId = project.CreateObject("ST07_ModifierStack_Twisted_Spire", "cube", 0, "ValidationWorld", "System").id;
         if (auto* spire = project.FindObject(spireId)) {
             spire->transform.position = {-3.8f, 1.25f, -3.5f};
             spire->transform.scale = {1.1f, 2.2f, 1.1f};
-            spire->material.materialName = "Graph_Compiled_Fresnel_Spire";
+            spire->material.materialName = "Graph_Compiled_DAG_Spire";
             spire->material.baseColor = {0.16f, 0.82f, 0.96f, 1.0f};
             spire->material.metallic = 0.68f;
             spire->material.roughness = 0.22f;
@@ -294,24 +298,52 @@ void PopulateStationObjects(core::ProjectState& project, const std::string& filt
             spire->mesh.modifierStack.push_back(modTwist);
 
             spire->logic.stationCategory = "ST-07";
-            spire->logic.stationDescription = "Non-destructive 3D Modifier Stack (Subdivide + TaperTwist) & Material Graph -> Slang compiler station (PLZ-MODEL-005, PLZ-MAT-001)";
+            spire->logic.stationDescription = "CPU-evaluated Non-Destructive Modifier Stack (uploaded to VMA) & 5-Node DAG Material Graph -> Slang compiler station (PLZ-MODEL-005, PLZ-MAT-001)";
         }
     }
 
     if (shouldBuild("ST-08")) {
-        // Gate 4 Station 8: 2D Pixel-Art Sprite Beacon & Patrol Drone with Time-Inspectable Debugger
+        // Gate 4 Station 8: Editable Multi-Layer 2D Pixel-Art Sprite (persisted JSON source + PLZT Vulkan nearest-neighbor texture) & Patrol Drone
+        creative::PixelArtCanvas droneCanvas(16, 16);
+        droneCanvas.spriteName = "ST08_Patrol_Emblem";
+        std::string sourceJson = droneCanvas.ToJsonString();
+        std::vector<uint8_t> sourceBytes(sourceJson.begin(), sourceJson.end());
+        auto srcAssetId = project.RegisterBinaryAsset(
+            "ST08_Patrol_Emblem_Source",
+            "pixel_source",
+            sourceBytes,
+            "assets/sprites/st08_patrol_emblem.platzpx.json",
+            "{}",
+            "PLATZ-Internal");
+
+        auto bakedImg = droneCanvas.BakeToImageData2D();
+        auto texBlob = bakedImg.SerializeToBinaryBlob();
+        nlohmann::json lineage = {{"sourcePixelAssetId", srcAssetId.value_or(0)}, {"filter", "VK_FILTER_NEAREST"}};
+        auto texAssetId = project.RegisterBinaryAsset(
+            "ST08_Patrol_Emblem_Texture",
+            "texture",
+            texBlob,
+            "assets/sprites/st08_patrol_emblem.plzt",
+            lineage.dump(),
+            "PLATZ-Internal");
+
         core::ObjectId droneId = project.CreateObject("ST08_PixelSprite_Patrol_Drone", "cube", 0, "ValidationWorld", "System").id;
         if (auto* drone = project.FindObject(droneId)) {
             drone->transform.position = {0.0f, 1.35f, 4.4f};
-            drone->transform.scale = {0.9f, 0.9f, 0.9f};
+            drone->transform.scale = {0.95f, 0.95f, 0.95f};
             drone->material.materialName = "PixelExact_Sprite_Emblem";
-            drone->material.baseColor = {0.96f, 0.82f, 0.24f, 1.0f};
-            drone->material.emissiveColor = {0.0f, 0.84f, 0.98f};
-            drone->material.emissiveStrength = 0.9f;
-            drone->material.useProceduralChecker = true;
+            drone->material.baseColor = {1.0f, 1.0f, 1.0f, 1.0f};
+            drone->material.metallic = 0.15f;
+            drone->material.roughness = 0.35f;
+            drone->material.emissiveColor = {0.0f, 0.45f, 0.55f};
+            drone->material.emissiveStrength = 0.08f;
+            drone->material.useProceduralChecker = false;
+            drone->material.pixelSourceAssetId = srcAssetId.value_or(0);
+            drone->material.albedoTextureAssetId = texAssetId.value_or(0);
+            drone->material.pixelCanvasJson = sourceJson;
             drone->logic.currentState = "Patrolling";
             drone->logic.stationCategory = "ST-08";
-            drone->logic.stationDescription = "2D Pixel-Exact Sprite Emblem & Waypoint Patrol Drone with Time-Inspectable Logic Debugger (PLZ-ART-007, PLZ-CREATEX2-004)";
+            drone->logic.stationDescription = "Editable Multi-Layer 2D Pixel-Exact Sprite (VK_FILTER_NEAREST Vulkan texture) & Waypoint Patrol Drone (PLZ-ART-007, PLZ-CREATEX2-004)";
 
             core::BehaviorRule patrolRule;
             patrolRule.ruleId = "rule_patrol_waypoints";
@@ -321,6 +353,67 @@ void PopulateStationObjects(core::ProjectState& project, const std::string& filt
             patrolRule.paramA = 2.6f; // Patrol span meters
             patrolRule.paramB = 1.6f; // Patrol frequency
             drone->logic.rules.push_back(patrolRule);
+        }
+    }
+
+    if (shouldBuild("ST-09")) {
+        // Gate 4 Batch B Station 9: Unified Keyframed Animation Timeline & 3D Spatial Audio DSP Sculpture
+        core::ObjectId kineticId = project.CreateObject("ST09_Animated_Audio_Kinetic_Sculpture", "torus", 0, "ValidationWorld", "System").id;
+        if (auto* kinetic = project.FindObject(kineticId)) {
+            kinetic->transform.position = {3.8f, 1.35f, -3.5f};
+            kinetic->transform.scale = {1.05f, 1.05f, 1.05f};
+            kinetic->material.materialName = "Kinetic_Harmonic_Emerald";
+            kinetic->material.baseColor = {0.14f, 0.88f, 0.68f, 1.0f};
+            kinetic->material.metallic = 0.78f;
+            kinetic->material.roughness = 0.18f;
+            kinetic->material.emissiveColor = {0.10f, 0.92f, 0.72f};
+            kinetic->material.emissiveStrength = 0.45f;
+
+            kinetic->animation.enabled = true;
+            kinetic->animation.loop = true;
+            kinetic->animation.durationSec = 4.0f;
+
+            core::AnimationTrack posTrack;
+            posTrack.trackId = "track_pos";
+            posTrack.targetProperty = "position";
+            posTrack.keyframes = {
+                {0.0f, {3.8f, 1.35f, -3.5f}, "EaseInOut"},
+                {2.0f, {3.8f, 2.35f, -3.5f}, "EaseInOut"},
+                {4.0f, {3.8f, 1.35f, -3.5f}, "EaseInOut"}
+            };
+            kinetic->animation.tracks.push_back(std::move(posTrack));
+
+            core::AnimationTrack rotTrack;
+            rotTrack.trackId = "track_rot";
+            rotTrack.targetProperty = "rotationEulerDeg";
+            rotTrack.keyframes = {
+                {0.0f, {15.0f, 0.0f, 0.0f}, "Linear"},
+                {2.0f, {45.0f, 180.0f, 15.0f}, "Linear"},
+                {4.0f, {15.0f, 360.0f, 0.0f}, "Linear"}
+            };
+            kinetic->animation.tracks.push_back(std::move(rotTrack));
+
+            core::AnimationTrack emTrack;
+            emTrack.trackId = "track_emissive";
+            emTrack.targetProperty = "emissiveStrength";
+            emTrack.keyframes = {
+                {0.0f, {0.35f, 0.0f, 0.0f}, "EaseInOut"},
+                {2.0f, {2.10f, 0.0f, 0.0f}, "EaseInOut"},
+                {4.0f, {0.35f, 0.0f, 0.0f}, "EaseInOut"}
+            };
+            kinetic->animation.tracks.push_back(std::move(emTrack));
+
+            kinetic->audio.enabled = true;
+            kinetic->audio.cueType = "CrystalChime";
+            kinetic->audio.volume = 0.65f;
+            kinetic->audio.pitch = 1.05f;
+            kinetic->audio.maxDistance = 24.0f;
+            kinetic->audio.spatial3D = true;
+            kinetic->audio.playOnInteract = true;
+            kinetic->audio.lowPassCutoffHz = 14000.0f;
+
+            kinetic->logic.stationCategory = "ST-09";
+            kinetic->logic.stationDescription = "Unified Keyframed Animation Timeline (EaseInOut/Linear tracks) & 3D Spatial Audio DSP Station (PLZ-MEDIA-001, PLZ-AUDIO-001, N-15)";
         }
     }
 }
@@ -337,21 +430,72 @@ bool ValidationWorldManager::EnsureValidationWorldPopulated(
 
     if (project.GetObjects().empty()) {
         PopulateStationObjects(project, "");
-        if (!project.SaveProject("Initialize PLATZ-Validation living world with 8 cumulative Gate 1-4 stations", "PLATZ System", outError)) {
+        if (!project.SaveProject("Initialize PLATZ-Validation living world with 9 cumulative Gate 1-4 stations", "PLATZ System", outError)) {
             return false;
         }
     } else {
-        // Ensure cumulative Gate 4 stations ST-07 and ST-08 are upgraded onto existing projects without losing ST-01..ST-06 identities! (PLZ-TEST-001, PLZ-FOUND-003)
+        // Non-destructive cumulative upgrades preserving existing ST-01..ST-08 identities! (PLZ-TEST-001, PLZ-FOUND-003)
         bool hasSt07 = false;
         bool hasSt08 = false;
-        for (const auto& obj : project.GetObjects()) {
-            if (obj.logic.stationCategory == "ST-07") hasSt07 = true;
-            if (obj.logic.stationCategory == "ST-08") hasSt08 = true;
+        bool hasSt09 = false;
+        bool upgradedExisting = false;
+
+        for (auto& obj : project.GetObjectsMutable()) {
+            if (obj.logic.stationCategory == "ST-07") {
+                hasSt07 = true;
+                auto existingGraph = creative::MaterialGraphDocument::FromJsonString(obj.material.materialGraphJson);
+                if (existingGraph.GetNodes().size() < 5 || !existingGraph.ValidateGraph().valid) {
+                    creative::MaterialGraphDocument matGraph;
+                    std::string waveId = matGraph.AddNode("WaveBands", {0.10f, 0.90f, 0.98f}, 7.0f, 0.25f, "node_albedo");
+                    matGraph.ConnectNodes(waveId, "node_checker", 0);
+                    obj.material.materialGraphJson = matGraph.ToJsonString();
+                    upgradedExisting = true;
+                }
+            }
+            if (obj.logic.stationCategory == "ST-08") {
+                hasSt08 = true;
+                if (obj.material.pixelCanvasJson.empty() || obj.material.albedoTextureAssetId == 0 || obj.material.emissiveStrength > 0.2f) {
+                    if (obj.material.pixelCanvasJson.empty() || obj.material.albedoTextureAssetId == 0) {
+                        creative::PixelArtCanvas droneCanvas(16, 16);
+                        droneCanvas.spriteName = "ST08_Patrol_Emblem";
+                        std::string sourceJson = droneCanvas.ToJsonString();
+                        std::vector<uint8_t> sourceBytes(sourceJson.begin(), sourceJson.end());
+                        auto srcAssetId = project.RegisterBinaryAsset(
+                            "ST08_Patrol_Emblem_Source",
+                            "pixel_source",
+                            sourceBytes,
+                            "assets/sprites/st08_patrol_emblem.platzpx.json",
+                            "{}",
+                            "PLATZ-Internal");
+                        auto bakedImg = droneCanvas.BakeToImageData2D();
+                        auto texBlob = bakedImg.SerializeToBinaryBlob();
+                        nlohmann::json lineage = {{"sourcePixelAssetId", srcAssetId.value_or(0)}, {"filter", "VK_FILTER_NEAREST"}};
+                        auto texAssetId = project.RegisterBinaryAsset(
+                            "ST08_Patrol_Emblem_Texture",
+                            "texture",
+                            texBlob,
+                            "assets/sprites/st08_patrol_emblem.plzt",
+                            lineage.dump(),
+                            "PLATZ-Internal");
+                        obj.material.pixelSourceAssetId = srcAssetId.value_or(0);
+                        obj.material.albedoTextureAssetId = texAssetId.value_or(0);
+                        obj.material.pixelCanvasJson = sourceJson;
+                    }
+                    obj.material.baseColor = {1.0f, 1.0f, 1.0f, 1.0f};
+                    obj.material.emissiveStrength = 0.08f;
+                    obj.material.useProceduralChecker = false;
+                    upgradedExisting = true;
+                }
+            }
+            if (obj.logic.stationCategory == "ST-09") {
+                hasSt09 = true;
+            }
         }
         if (!hasSt07) PopulateStationObjects(project, "ST-07");
         if (!hasSt08) PopulateStationObjects(project, "ST-08");
-        if (!hasSt07 || !hasSt08) {
-            if (!project.SaveProject("Cumulative upgrade: add ST-07 (ModifierStack & MaterialGraph) and ST-08 (PixelSprite & Patrol)", "PLATZ System", outError)) {
+        if (!hasSt09) PopulateStationObjects(project, "ST-09");
+        if (!hasSt07 || !hasSt08 || !hasSt09 || upgradedExisting) {
+            if (!project.SaveProject("Cumulative upgrade: 5-node Material DAG (ST-07), editable multi-layer Pixel Sprite (ST-08), Animation Timeline & Spatial Audio (ST-09)", "PLATZ System", outError)) {
                 return false;
             }
         }
@@ -391,10 +535,12 @@ std::vector<ValidationStationInfo> ValidationWorldManager::GetStations(const cor
          "Event/Condition/Action state transitions and transactional conserved resource transfers.", {}},
         {"ST-06", "Station 6: PLATZ AI Staged Commands & Native Specialist Workbench", "Gate 3 (PLZ-AI-001..010, PLZ-SAFEX-001..011, J-05)", "VERIFIED",
          "Revision-pinned AI staging, Emergency Stop revocation, and local 12x24x7 neural material specialist.", {}},
-        {"ST-07", "Station 7: Non-Destructive 3D Modifier Stack & Material Graph Compiler", "Gate 4 (PLZ-MODEL-005, PLZ-MAT-001, PLZ-RENDERX-002)", "VERIFIED",
-         "Ordered non-destructive modifier stack (Subdivide + TaperTwist) and visual Material Node Graph -> Slang shader compiler.", {}},
-        {"ST-08", "Station 8: 2D Pixel-Exact Sprite & Time-Inspectable Patrol Logic", "Gate 4 (PLZ-ART-007, PLZ-CREATEX2-004, N-14)", "VERIFIED",
-         "Indexed 2D pixel-art sprite canvas with nearest-neighbor sampling and waypoint patrol time-travel logic debugger.", {}}
+        {"ST-07", "Station 7: CPU-Evaluated Modifier Stack & Expandable DAG Material Graph", "Gate 4 (PLZ-MODEL-005, PLZ-MAT-001, PLZ-RENDERX-002)", "VERIFIED",
+         "Ordered CPU-evaluated non-destructive modifier stack uploaded to Vulkan VMA and expandable validated DAG Material Graph -> Slang shader compiler.", {}},
+        {"ST-08", "Station 8: Editable Multi-Layer 2D Pixel-Art Sprite & Patrol Debugger", "Gate 4 (PLZ-ART-007, PLZ-CREATEX2-004, N-14)", "VERIFIED",
+         "Persisted multi-layer indexed 2D pixel-art canvas bound live onto 3D Vulkan nearest-neighbor texture with time-travel patrol logic debugger.", {}},
+        {"ST-09", "Station 9: Unified Keyframed Animation Timeline & 3D Spatial Audio DSP", "Gate 4 Batch B (PLZ-MEDIA-001, PLZ-AUDIO-001, N-15)", "VERIFIED",
+         "Keyframed multi-track Animation Timeline (EaseInOut/Linear/Step) and SDL3 3D Spatial Audio procedural DSP mixer.", {}}
     };
 
     for (const auto& obj : project.GetObjects()) {
@@ -475,35 +621,82 @@ ValidationRouteReceipt ValidationWorldManager::RunAutomatedVerificationRoute(cor
             }
         } else if (st.stationId == "ST-07") {
             const core::SceneObject* obj = project.FindObject(st.primaryObjectIds.front());
-            if (obj && !obj->mesh.modifierStack.empty()) {
+            if (obj && !obj->mesh.modifierStack.empty() && !obj->material.materialGraphJson.empty()) {
                 creative::MeshData base = creative::MeshGenerator::GenerateCube(1.0f);
                 creative::MeshData evaluated = creative::MeshGenerator::EvaluateModifierStack(base, obj->mesh.modifierStack);
-                creative::MaterialGraphDocument graph = creative::MaterialGraphDocument::FromJsonString(obj->material.materialGraphJson);
+                auto graph = creative::MaterialGraphDocument::FromJsonString(obj->material.materialGraphJson);
                 std::string slangCode;
-                if (evaluated.ValidateTopology() && graph.CompileToSlangShaderSource(&slangCode) && !slangCode.empty()) {
+                if (evaluated.ValidateTopology() && graph.ValidateGraph().valid &&
+                    graph.CompileToSlangShaderSource(&slangCode) && !slangCode.empty()) {
                     ++rec.stationsPassed;
-                    rec.stationReceipts.push_back("[PASS] ST-07: Non-destructive Modifier Stack (" +
+                    rec.stationReceipts.push_back("[PASS] ST-07: CPU Modifier Stack (" +
                                                   std::to_string(evaluated.indices.size() / 3) +
-                                                  " tris) & Material Graph -> Slang compiler verified");
+                                                  " tris) & " + std::to_string(graph.GetNodes().size()) +
+                                                  "-Node DAG Material Graph -> Slang compiler verified");
                 } else {
-                    rec.stationReceipts.push_back("[FAIL] ST-07: Modifier stack or Material Graph validation failed");
+                    rec.stationReceipts.push_back("[FAIL] ST-07: Modifier stack or Material DAG validation failed");
                 }
             } else {
-                rec.stationReceipts.push_back("[FAIL] ST-07: Missing modifier stack on station object");
+                rec.stationReceipts.push_back("[FAIL] ST-07: Missing modifier stack or Material Graph on station object");
             }
         } else if (st.stationId == "ST-08") {
-            creative::PixelArtCanvas canvas(16, 16);
-            auto img = canvas.BakeToImageData2D();
+            const core::SceneObject* obj = project.FindObject(st.primaryObjectIds.front());
+            bool hasSourceJson = obj && !obj->material.pixelCanvasJson.empty();
+            const core::AssetMetadata* texAst = obj ? project.FindAsset(obj->material.albedoTextureAssetId) : nullptr;
+            bool blobOk = texAst && project.GetAssetStore().HasVerifiedBlob(texAst->contentSha256);
             engine::runtime::RuntimeSession rt;
             rt.StartPlay(project);
             rt.StepSimulation(0.08);
             bool hasTimeline = !rt.GetDebuggerTimeline().empty();
             rt.StopPlay();
-            if (img.pixelExactNearest && img.width == 16 && hasTimeline) {
-                ++rec.stationsPassed;
-                rec.stationReceipts.push_back("[PASS] ST-08: 2D Pixel-Exact Sprite & Time-Inspectable Patrol Logic Debugger verified");
+            if (hasSourceJson && blobOk && hasTimeline) {
+                auto canvas = creative::PixelArtCanvas::FromJsonString(obj->material.pixelCanvasJson);
+                auto img = canvas.BakeToImageData2D();
+                if (canvas.layers.size() >= 2 && img.pixelExactNearest && img.width == 16) {
+                    ++rec.stationsPassed;
+                    rec.stationReceipts.push_back("[PASS] ST-08: Persisted " +
+                                                  std::to_string(canvas.layers.size()) +
+                                                  "-layer Pixel-Exact Sprite + PLZT Texture Asset & Logic Debugger verified");
+                } else {
+                    rec.stationReceipts.push_back("[FAIL] ST-08: Baked pixel sprite layers, dimensions, or filter invalid");
+                }
             } else {
-                rec.stationReceipts.push_back("[FAIL] ST-08: Pixel sprite or logic timeline verification failed");
+                rec.stationReceipts.push_back("[FAIL] ST-08: Persisted multi-layer pixel source, texture blob, or logic timeline missing");
+            }
+        } else if (st.stationId == "ST-09") {
+            const core::SceneObject* obj = project.FindObject(st.primaryObjectIds.front());
+            if (obj && obj->animation.enabled && !obj->animation.tracks.empty() && obj->audio.enabled) {
+                core::SceneObject animSample = *obj;
+                engine::runtime::RuntimeSession::EvaluateObjectAnimationAtTime(animSample, 2.0);
+                bool movedY = (animSample.transform.position.y > obj->transform.position.y + 0.5f);
+
+                platform::SpatialAudioEngine audio;
+                audio.Initialize(true); // Headless software DSP verification
+                platform::SpatialAudioCueRequest cue;
+                cue.cueType = obj->audio.cueType;
+                cue.sourceWorldPos = animSample.transform.position;
+                cue.volume = obj->audio.volume;
+                cue.pitch = obj->audio.pitch;
+                cue.maxDistance = obj->audio.maxDistance;
+                cue.spatial3D = obj->audio.spatial3D;
+                cue.lowPassCutoffHz = obj->audio.lowPassCutoffHz;
+                std::vector<float> stereoBuf;
+                audio.PlaySpatialCue(cue, {0.0f, 2.0f, 6.0f}, {1.0f, 0.0f, 0.0f}, &stereoBuf);
+                float peak = 0.0f;
+                for (float s : stereoBuf) peak = std::max(peak, std::abs(s));
+                audio.Shutdown();
+
+                if (movedY && peak > 0.01f) {
+                    ++rec.stationsPassed;
+                    rec.stationReceipts.push_back("[PASS] ST-09: Keyframed Animation Timeline (" +
+                                                  std::to_string(obj->animation.tracks.size()) +
+                                                  " tracks) & 3D Spatial Audio DSP verified (peak=" +
+                                                  std::to_string(peak).substr(0, 4) + ")");
+                } else {
+                    rec.stationReceipts.push_back("[FAIL] ST-09: Animation evaluation or Spatial Audio DSP synthesis produced invalid output");
+                }
+            } else {
+                rec.stationReceipts.push_back("[FAIL] ST-09: Missing AnimationComponent or AudioSourceComponent on station object");
             }
         }
     }

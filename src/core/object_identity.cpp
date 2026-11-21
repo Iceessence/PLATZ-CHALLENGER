@@ -120,6 +120,23 @@ nlohmann::json SceneObject::ToJson() const {
         });
     }
 
+    nlohmann::json tracksJson = nlohmann::json::array();
+    for (const auto& tr : animation.tracks) {
+        nlohmann::json kfs = nlohmann::json::array();
+        for (const auto& kf : tr.keyframes) {
+            kfs.push_back({
+                {"timeSec", kf.timeSec},
+                {"value", Vec3ToJson(kf.value)},
+                {"interpolation", kf.interpolation}
+            });
+        }
+        tracksJson.push_back({
+            {"trackId", tr.trackId},
+            {"targetProperty", tr.targetProperty},
+            {"keyframes", std::move(kfs)}
+        });
+    }
+
     nlohmann::json rulesJson = nlohmann::json::array();
     for (const auto& r : logic.rules) {
         rulesJson.push_back({
@@ -166,7 +183,9 @@ nlohmann::json SceneObject::ToJson() const {
             {"normalScale", material.normalScale},
             {"useProceduralChecker", material.useProceduralChecker},
             {"albedoTextureAssetId", material.albedoTextureAssetId},
-            {"materialGraphJson", material.materialGraphJson}
+            {"pixelSourceAssetId", material.pixelSourceAssetId},
+            {"materialGraphJson", material.materialGraphJson},
+            {"pixelCanvasJson", material.pixelCanvasJson}
         }},
         {"light", {
             {"enabled", light.enabled},
@@ -185,6 +204,23 @@ nlohmann::json SceneObject::ToJson() const {
             {"linearVelocity", Vec3ToJson(physics.linearVelocity)},
             {"angularVelocityDeg", Vec3ToJson(physics.angularVelocityDeg)},
             {"colliderHalfExtents", Vec3ToJson(physics.colliderHalfExtents)}
+        }},
+        {"animation", {
+            {"enabled", animation.enabled},
+            {"loop", animation.loop},
+            {"durationSec", animation.durationSec},
+            {"tracks", std::move(tracksJson)}
+        }},
+        {"audio", {
+            {"enabled", audio.enabled},
+            {"cueType", audio.cueType},
+            {"volume", audio.volume},
+            {"pitch", audio.pitch},
+            {"maxDistance", audio.maxDistance},
+            {"spatial3D", audio.spatial3D},
+            {"playOnInteract", audio.playOnInteract},
+            {"playOnCollision", audio.playOnCollision},
+            {"lowPassCutoffHz", audio.lowPassCutoffHz}
         }},
         {"logic", {
             {"currentState", logic.currentState},
@@ -242,7 +278,9 @@ SceneObject SceneObject::FromJson(const nlohmann::json& j) {
         obj.material.normalScale = mat.value("normalScale", 1.0f);
         obj.material.useProceduralChecker = mat.value("useProceduralChecker", false);
         obj.material.albedoTextureAssetId = mat.value("albedoTextureAssetId", AssetId{0});
+        obj.material.pixelSourceAssetId = mat.value("pixelSourceAssetId", AssetId{0});
         obj.material.materialGraphJson = mat.value("materialGraphJson", std::string(""));
+        obj.material.pixelCanvasJson = mat.value("pixelCanvasJson", std::string(""));
     }
     if (j.contains("light")) {
         const auto& l = j["light"];
@@ -263,6 +301,41 @@ SceneObject SceneObject::FromJson(const nlohmann::json& j) {
         obj.physics.linearVelocity = JsonToVec3(p.value("linearVelocity", nlohmann::json::array()), glm::vec3(0.0f));
         obj.physics.angularVelocityDeg = JsonToVec3(p.value("angularVelocityDeg", nlohmann::json::array()), glm::vec3(0.0f));
         obj.physics.colliderHalfExtents = JsonToVec3(p.value("colliderHalfExtents", nlohmann::json::array()), glm::vec3(0.5f));
+    }
+    if (j.contains("animation")) {
+        const auto& an = j["animation"];
+        obj.animation.enabled = an.value("enabled", false);
+        obj.animation.loop = an.value("loop", true);
+        obj.animation.durationSec = an.value("durationSec", 4.0f);
+        if (an.contains("tracks") && an["tracks"].is_array()) {
+            for (const auto& tj : an["tracks"]) {
+                AnimationTrack tr;
+                tr.trackId = tj.value("trackId", std::string("track_pos"));
+                tr.targetProperty = tj.value("targetProperty", std::string("position"));
+                if (tj.contains("keyframes") && tj["keyframes"].is_array()) {
+                    for (const auto& kfj : tj["keyframes"]) {
+                        AnimationKeyframe kf;
+                        kf.timeSec = kfj.value("timeSec", 0.0f);
+                        kf.value = JsonToVec3(kfj.value("value", nlohmann::json::array()), glm::vec3(0.0f));
+                        kf.interpolation = kfj.value("interpolation", std::string("EaseInOut"));
+                        tr.keyframes.push_back(std::move(kf));
+                    }
+                }
+                obj.animation.tracks.push_back(std::move(tr));
+            }
+        }
+    }
+    if (j.contains("audio")) {
+        const auto& au = j["audio"];
+        obj.audio.enabled = au.value("enabled", false);
+        obj.audio.cueType = au.value("cueType", std::string("CrystalChime"));
+        obj.audio.volume = au.value("volume", 0.75f);
+        obj.audio.pitch = au.value("pitch", 1.0f);
+        obj.audio.maxDistance = au.value("maxDistance", 25.0f);
+        obj.audio.spatial3D = au.value("spatial3D", true);
+        obj.audio.playOnInteract = au.value("playOnInteract", true);
+        obj.audio.playOnCollision = au.value("playOnCollision", true);
+        obj.audio.lowPassCutoffHz = au.value("lowPassCutoffHz", 12000.0f);
     }
     if (j.contains("logic")) {
         const auto& lg = j["logic"];

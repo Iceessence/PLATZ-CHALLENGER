@@ -109,6 +109,7 @@ bool ProjectState::ReloadFromDisk(std::optional<RevisionId> specificRevision, st
     objects_ = std::move(loadedObjs);
     assets_ = std::move(loadedAssets);
     dirty_ = false;
+    ++mutationGeneration_;
     return true;
 }
 
@@ -158,6 +159,7 @@ SceneObject& ProjectState::CreateObject(
     objects_.push_back(obj);
     RecordMultiObjectBatch("Create " + name, domain, author, {diff});
     dirty_ = true;
+    ++mutationGeneration_;
     return objects_.back();
 }
 
@@ -179,6 +181,7 @@ std::optional<ObjectId> ProjectState::DuplicateObject(ObjectId sourceId, const s
     objects_.push_back(copy);
     RecordMultiObjectBatch("Duplicate " + src->name, "Scene", author, {diff});
     dirty_ = true;
+    ++mutationGeneration_;
     return copy.id;
 }
 
@@ -204,6 +207,7 @@ bool ProjectState::DeleteObject(ObjectId id, const std::string& author) {
 
     RecordMultiObjectBatch("Delete " + deletedName, "Scene", author, {diff});
     dirty_ = true;
+    ++mutationGeneration_;
     return true;
 }
 
@@ -232,6 +236,7 @@ bool ProjectState::ApplyObjectMutation(
     uint64_t bid = RecordMultiObjectBatch(actionLabel, domain, author, {diff});
     if (outBatchId) *outBatchId = bid;
     dirty_ = true;
+    ++mutationGeneration_;
     return true;
 }
 
@@ -306,6 +311,7 @@ void ProjectState::ApplyDiffRecords(const std::vector<ObjectDiffRecord>& diffs, 
         }
     }
     dirty_ = true;
+    ++mutationGeneration_;
 }
 
 bool ProjectState::Undo(std::string* outLabel) {
@@ -398,6 +404,7 @@ std::optional<AssetId> ProjectState::RegisterBinaryAsset(
 
     assets_.push_back(meta);
     dirty_ = true;
+    ++mutationGeneration_;
     return meta.assetId;
 }
 
@@ -405,7 +412,9 @@ std::vector<ObjectId> ProjectState::GetDependentObjectsForAsset(AssetId assetId)
     std::vector<ObjectId> deps;
     if (assetId == 0) return deps;
     for (const auto& obj : objects_) {
-        if (obj.mesh.meshAssetId == assetId || obj.material.albedoTextureAssetId == assetId) {
+        if (obj.mesh.meshAssetId == assetId ||
+            obj.material.albedoTextureAssetId == assetId ||
+            obj.material.pixelSourceAssetId == assetId) {
             deps.push_back(obj.id);
         }
     }
@@ -430,6 +439,7 @@ bool ProjectState::UpdateAssetPayload(
     meta->byteSize = newPayload.size();
     meta->generationVersion += 1;
     dirty_ = true;
+    ++mutationGeneration_;
 
     if (outInvalidatedDependents) {
         *outInvalidatedDependents = GetDependentObjectsForAsset(assetId);

@@ -260,6 +260,21 @@ TEST_CASE("N-22, N-23 & PLZ-AIX-012: Training Privacy Separation, Anti-Self-Appr
 
     CHECK_FALSE(specialist.AttemptUnauthorizedSelfPromotionOrHoldoutEdit("VERIFIED_CANDIDATE", /*attemptModifyHoldout=*/true, &denialReason));
     CHECK(denialReason.find("holdout") != std::string::npos);
+
+    // 5. Same N-22 privacy and N-23 anti-self-approval invariants enforced on NativeGameplayBalanceSpecialistModel
+    ai::NativeGameplayBalanceSpecialistModel gpSpec;
+    std::vector<ai::GameplayTrainingSample> gpTrain, gpHoldout;
+    ai::NativeGameplayBalanceSpecialistModel::BuildDefaultGameplayDataset(&gpTrain, &gpHoldout);
+    auto poisonedGp = gpTrain;
+    poisonedGp[0].isRestrictedPrivate = true;
+    auto gpRej = gpSpec.TrainAndEvaluate(poisonedGp, gpHoldout, hp);
+    CHECK_FALSE(gpRej.convergedAndQualified);
+    CHECK(gpRej.qualificationStatus == "REJECTED_PROVENANCE_OR_PRIVACY");
+
+    auto gpGood = gpSpec.TrainDefaultGameplaySpecialist();
+    CHECK(gpGood.convergedAndQualified);
+    CHECK_FALSE(gpSpec.AttemptUnauthorizedSelfPromotionOrHoldoutEdit("INDEPENDENTLY_ACCEPTED", false, &denialReason));
+    CHECK_FALSE(gpSpec.AttemptUnauthorizedSelfPromotionOrHoldoutEdit("VERIFIED_CANDIDATE", true, &denialReason));
 }
 
 TEST_CASE("N-24, N-26, N-27, N-28: Protected Stop UI Control Guard, Incompatible Schema Rejection & Export Provenance Gate") {

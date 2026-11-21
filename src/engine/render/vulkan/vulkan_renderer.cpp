@@ -316,6 +316,13 @@ void VulkanRenderer::Shutdown() {
         }
         customAssetMeshes_.clear();
 
+        for (auto& [id, t] : customAssetTextures_) {
+            ctx_.DestroyImageImmediate(t.image);
+        }
+        customAssetTextures_.clear();
+        lastSyncedProjectGeneration_ = 0;
+        derivedCachesDirty_ = true;
+
         for (auto& [id, m] : modifiedObjectMeshes_) {
             ctx_.DestroyBufferImmediate(m.vertexBuffer);
             ctx_.DestroyBufferImmediate(m.indexBuffer);
@@ -536,6 +543,31 @@ bool VulkanRenderer::CreateSwapchain(std::string* outError) {
 
     swapchainSupportsTransferSrc_ = ((surfCaps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0);
 
+    // Choose present mode: FIFO for comfortable VSync interactive editing, MAILBOX/IMMEDIATE when unlocked for benchmarking
+    VkPresentModeKHR chosenPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+    perfMetrics_.presentModeName = "FIFO";
+    if (!preferVsyncFifo_) {
+        uint32_t pmCount = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, &pmCount, nullptr);
+        std::vector<VkPresentModeKHR> modes(pmCount);
+        if (pmCount > 0) {
+            vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, &pmCount, modes.data());
+        }
+        bool hasMailbox = false;
+        bool hasImmediate = false;
+        for (VkPresentModeKHR pm : modes) {
+            if (pm == VK_PRESENT_MODE_MAILBOX_KHR) hasMailbox = true;
+            if (pm == VK_PRESENT_MODE_IMMEDIATE_KHR) hasImmediate = true;
+        }
+        if (hasMailbox) {
+            chosenPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+            perfMetrics_.presentModeName = "MAILBOX";
+        } else if (hasImmediate) {
+            chosenPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            perfMetrics_.presentModeName = "IMMEDIATE";
+        }
+    }
+
     VkSwapchainCreateInfoKHR scInfo{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     scInfo.surface = surface;
     scInfo.minImageCount = imageCount;
@@ -548,7 +580,7 @@ bool VulkanRenderer::CreateSwapchain(std::string* outError) {
     scInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     scInfo.preTransform = surfCaps.currentTransform;
     scInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    scInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    scInfo.presentMode = chosenPresentMode;
     scInfo.clipped = VK_TRUE;
 
     if (vkCreateSwapchainKHR(dev, &scInfo, nullptr, &swapchain_) != VK_SUCCESS) {
@@ -631,12 +663,13 @@ bool VulkanRenderer::CreateDescriptorsAndPipelines(std::string* outError) {
 
     VkDescriptorPoolSize poolSizes[2]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = 16;
+    poolSizes[0].descriptorCount = 256;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = 16;
+    poolSizes[1].descriptorCount = 256;
 
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolInfo.maxSets = 16;
+    poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    poolInfo.maxSets = 256;
     poolInfo.poolSizeCount = 2;
     poolInfo.pPoolSizes = poolSizes;
     if (vkCreateDescriptorPool(dev, &poolInfo, nullptr, &descriptorPool_) != VK_SUCCESS) {
@@ -1102,49 +1135,167 @@ bool VulkanRenderer::UploadTextureToGpu(
 }
 
 void VulkanRenderer::InvalidateDerivedGpuCaches() {
+    if (ctx_.IsInitialized()) {
+        vkDeviceWaitIdle(ctx_.GetDevice());
+    }
     for (auto& [id, res] : customAssetMeshes_) {
-        ctx_.DeferDestroyBuffer(currentFrameSlot_, res.vertexBuffer);
-        ctx_.DeferDestroyBuffer(currentFrameSlot_, res.indexBuffer);
+        ctx_.DestroyBufferImmediate(res.vertexBuffer);
+        ctx_.DestroyBufferImmediate(res.indexBuffer);
     }
     customAssetMeshes_.clear();
 
+    for (auto& [id, tex] : customAssetTextures_) {
+        ctx_.DestroyImageImmediate(tex.image);
+        for (uint32_t i = 0; i < VulkanContext::kMaxFramesInFlight; ++i) {
+            if (tex.sceneDescriptorSets[i] != VK_NULL_HANDLE && descriptorPool_ != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(ctx_.GetDevice(), descriptorPool_, 1, &tex.sceneDescriptorSets[i]);
+                tex.sceneDescriptorSets[i] = VK_NULL_HANDLE;
+            }
+        }
+    }
+    customAssetTextures_.clear();
+
     for (auto& [id, res] : modifiedObjectMeshes_) {
-        ctx_.DeferDestroyBuffer(currentFrameSlot_, res.vertexBuffer);
-        ctx_.DeferDestroyBuffer(currentFrameSlot_, res.indexBuffer);
+        ctx_.DestroyBufferImmediate(res.vertexBuffer);
+        ctx_.DestroyBufferImmediate(res.indexBuffer);
     }
     modifiedObjectMeshes_.clear();
+
+    lastSyncedProjectGeneration_ = 0;
+    derivedCachesDirty_ = true;
 }
 
 bool VulkanRenderer::EnsureProjectGpuResourcesSynced(
     const core::ProjectState& project,
     const std::vector<core::SceneObject>& activeObjects,
     std::string* outError) {
-    // 1. Sync content-addressed custom mesh assets
-    for (const auto& ast : project.GetAssets()) {
-        if (ast.assetType != "mesh") continue;
-        auto it = customAssetMeshes_.find(ast.assetId);
-        if (it != customAssetMeshes_.end() && it->second.assetGeneration == ast.generationVersion) {
-            continue;
-        }
-        auto blobOpt = project.GetAssetStore().ReadBlobVerified(ast.contentSha256, outError);
-        if (!blobOpt) {
-            return false;
-        }
-        creative::MeshData mesh;
-        if (!creative::MeshData::DeserializeFromBinaryBlob(*blobOpt, &mesh, outError)) {
-            return false;
-        }
-        mesh.name = ast.logicalName;
-        GpuMeshResource gpuRes{};
-        if (!UploadMeshToGpu(mesh, &gpuRes, outError)) {
-            return false;
-        }
-        gpuRes.assetGeneration = ast.generationVersion;
-        customAssetMeshes_[ast.assetId] = std::move(gpuRes);
-        ++perfMetrics_.rebuiltCacheCount;
+    // O(1) steady-state fast path when no canonical project mutation or cache invalidation occurred
+    if (!derivedCachesDirty_ && project.GetMutationGeneration() == lastSyncedProjectGeneration_) {
+        ++perfMetrics_.gpuSyncSkipsCount;
+        return true;
     }
 
-    // 2. Sync per-object non-destructive Modifier Stack derived GPU meshes (PLZ-MODEL-005, PLZ-ARCH-004)
+    // 1. Sync content-addressed custom mesh assets
+    for (const auto& ast : project.GetAssets()) {
+        if (ast.assetType == "mesh") {
+            auto it = customAssetMeshes_.find(ast.assetId);
+            if (it != customAssetMeshes_.end() && it->second.assetGeneration == ast.generationVersion) {
+                continue;
+            }
+            auto blobOpt = project.GetAssetStore().ReadBlobVerified(ast.contentSha256, outError);
+            if (!blobOpt) {
+                return false;
+            }
+            creative::MeshData mesh;
+            if (!creative::MeshData::DeserializeFromBinaryBlob(*blobOpt, &mesh, outError)) {
+                return false;
+            }
+            mesh.name = ast.logicalName;
+            GpuMeshResource gpuRes{};
+            if (!UploadMeshToGpu(mesh, &gpuRes, outError)) {
+                return false;
+            }
+            gpuRes.assetGeneration = ast.generationVersion;
+            if (it != customAssetMeshes_.end()) {
+                ctx_.DeferDestroyBuffer(currentFrameSlot_, it->second.vertexBuffer);
+                ctx_.DeferDestroyBuffer(currentFrameSlot_, it->second.indexBuffer);
+            }
+            customAssetMeshes_[ast.assetId] = std::move(gpuRes);
+            ++perfMetrics_.rebuiltCacheCount;
+        } else if (ast.assetType == "texture") {
+            auto it = customAssetTextures_.find(ast.assetId);
+            if (it != customAssetTextures_.end() && it->second.assetGeneration == ast.generationVersion) {
+                continue;
+            }
+            auto blobOpt = project.GetAssetStore().ReadBlobVerified(ast.contentSha256, outError);
+            if (!blobOpt) {
+                return false;
+            }
+            creative::ImageData2D img;
+            if (!creative::ImageData2D::DeserializeFromBinaryBlob(*blobOpt, &img, nullptr)) {
+                // Graceful fallback for legacy raw RGBA square blobs
+                size_t pixelCount = blobOpt->size() / 4;
+                uint32_t side = static_cast<uint32_t>(std::round(std::sqrt(static_cast<double>(pixelCount))));
+                if (side > 0 && static_cast<size_t>(side) * side * 4 == blobOpt->size()) {
+                    img.width = side;
+                    img.height = side;
+                    img.pixelExactNearest = (side <= 64);
+                    img.rgbaPixels = *blobOpt;
+                } else {
+                    continue;
+                }
+            }
+
+            VkDescriptorSet reusedSets[VulkanContext::kMaxFramesInFlight]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+            if (it != customAssetTextures_.end()) {
+                vkDeviceWaitIdle(ctx_.GetDevice());
+                for (uint32_t i = 0; i < VulkanContext::kMaxFramesInFlight; ++i) {
+                    reusedSets[i] = it->second.sceneDescriptorSets[i];
+                }
+                ctx_.DestroyImageImmediate(it->second.image);
+            }
+
+            GpuTextureResource gpuTex{};
+            if (!UploadTextureToGpu(img, &gpuTex, outError)) {
+                return false;
+            }
+            gpuTex.assetGeneration = ast.generationVersion;
+            gpuTex.pixelExactNearest = img.pixelExactNearest;
+
+            VkDevice dev = ctx_.GetDevice();
+            if (reusedSets[0] == VK_NULL_HANDLE) {
+                VkDescriptorSetLayout layouts[VulkanContext::kMaxFramesInFlight] = {
+                    sceneDescriptorLayout_,
+                    sceneDescriptorLayout_
+                };
+                VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                allocInfo.descriptorPool = descriptorPool_;
+                allocInfo.descriptorSetCount = VulkanContext::kMaxFramesInFlight;
+                allocInfo.pSetLayouts = layouts;
+                if (vkAllocateDescriptorSets(dev, &allocInfo, reusedSets) != VK_SUCCESS) {
+                    ctx_.DestroyImageImmediate(gpuTex.image);
+                    if (outError) *outError = "vkAllocateDescriptorSets failed for custom texture asset";
+                    return false;
+                }
+            }
+
+            for (uint32_t i = 0; i < VulkanContext::kMaxFramesInFlight; ++i) {
+                gpuTex.sceneDescriptorSets[i] = reusedSets[i];
+
+                VkDescriptorBufferInfo bufInfo{};
+                bufInfo.buffer = sceneUniformBuffers_[i].buffer;
+                bufInfo.offset = 0;
+                bufInfo.range = sizeof(GpuSceneUniforms);
+
+                VkDescriptorImageInfo imgInfo{};
+                imgInfo.sampler = img.pixelExactNearest ? nearestSampler_ : linearSampler_;
+                imgInfo.imageView = gpuTex.image.view;
+                imgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+                VkWriteDescriptorSet writes[2]{};
+                writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[0].dstSet = gpuTex.sceneDescriptorSets[i];
+                writes[0].dstBinding = 0;
+                writes[0].descriptorCount = 1;
+                writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                writes[0].pBufferInfo = &bufInfo;
+
+                writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[1].dstSet = gpuTex.sceneDescriptorSets[i];
+                writes[1].dstBinding = 1;
+                writes[1].descriptorCount = 1;
+                writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[1].pImageInfo = &imgInfo;
+
+                vkUpdateDescriptorSets(dev, 2, writes, 0, nullptr);
+            }
+
+            customAssetTextures_[ast.assetId] = std::move(gpuTex);
+            ++perfMetrics_.rebuiltCacheCount;
+        }
+    }
+
+    // 2. Sync per-object CPU-evaluated non-destructive Modifier Stack meshes uploaded to Vulkan VMA device memory
     for (const auto& obj : activeObjects) {
         if (obj.mesh.modifierStack.empty()) {
             auto it = modifiedObjectMeshes_.find(obj.id);
@@ -1185,6 +1336,8 @@ bool VulkanRenderer::EnsureProjectGpuResourcesSynced(
         ++perfMetrics_.rebuiltCacheCount;
     }
 
+    lastSyncedProjectGeneration_ = project.GetMutationGeneration();
+    derivedCachesDirty_ = false;
     return true;
 }
 
@@ -1319,6 +1472,7 @@ void VulkanRenderer::RecordOffscreenScenePass(
 
     if (pbrPipeline_ != VK_NULL_HANDLE) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pbrPipeline_);
+        VkDescriptorSet currentBoundSet = sceneDescriptorSets_[frameSlot];
 
         auto findById = [&](core::ObjectId id) -> const core::SceneObject* {
             for (const auto& o : activeObjects) {
@@ -1351,6 +1505,30 @@ void VulkanRenderer::RecordOffscreenScenePass(
             }
             if (!gpuMesh || gpuMesh->indexCount == 0) continue;
 
+            // Bind per-object custom GPU texture descriptor set (e.g. nearest-neighbor pixel art sprite) when assigned
+            bool hasCustomTexture = false;
+            VkDescriptorSet desiredSet = sceneDescriptorSets_[frameSlot];
+            if (obj.material.albedoTextureAssetId != 0) {
+                auto texIt = customAssetTextures_.find(obj.material.albedoTextureAssetId);
+                if (texIt != customAssetTextures_.end() &&
+                    texIt->second.sceneDescriptorSets[frameSlot] != VK_NULL_HANDLE) {
+                    desiredSet = texIt->second.sceneDescriptorSets[frameSlot];
+                    hasCustomTexture = true;
+                }
+            }
+            if (desiredSet != currentBoundSet) {
+                vkCmdBindDescriptorSets(
+                    cmd,
+                    VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    pbrPipelineLayout_,
+                    0,
+                    1,
+                    &desiredSet,
+                    0,
+                    nullptr);
+                currentBoundSet = desiredSet;
+            }
+
             glm::mat4 worldMat = obj.transform.ToLocalMatrix();
             core::ObjectId pid = obj.parentId;
             int guard = 0;
@@ -1377,7 +1555,7 @@ void VulkanRenderer::RecordOffscreenScenePass(
             pc.objectIdLow = static_cast<uint32_t>(obj.id & 0xFFFFFFFFu);
             pc.objectIdHigh = static_cast<uint32_t>((obj.id >> 32) & 0xFFFFFFFFu);
             pc.textureFlags = (obj.material.useProceduralChecker ? 1u : 0u) |
-                              ((obj.material.albedoTextureAssetId != 0) ? 2u : 0u);
+                              (hasCustomTexture ? 2u : 0u);
 
             vkCmdPushConstants(
                 cmd,
@@ -1441,11 +1619,13 @@ bool VulkanRenderer::RenderSceneOffscreen(
         return false;
     }
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
 
+    auto tSync0 = std::chrono::steady_clock::now();
     if (!EnsureProjectGpuResourcesSynced(project, activeObjects, outError)) {
         return false;
     }
+    auto tSync1 = std::chrono::steady_clock::now();
 
     VkDevice dev = ctx_.GetDevice();
     uint32_t slot = currentFrameSlot_;
@@ -1454,6 +1634,7 @@ bool VulkanRenderer::RenderSceneOffscreen(
 
     ctx_.FlushDeferredDeletionsForFrame(slot);
 
+    auto tRec0 = std::chrono::steady_clock::now();
     VkCommandBuffer cmd = frameCommandBuffers_[slot];
     vkResetCommandBuffer(cmd, 0);
 
@@ -1464,7 +1645,9 @@ bool VulkanRenderer::RenderSceneOffscreen(
     RecordOffscreenScenePass(cmd, slot, activeObjects, project, camera, selectedObjectId);
 
     vkEndCommandBuffer(cmd);
+    auto tRec1 = std::chrono::steady_clock::now();
 
+    auto tSub0 = std::chrono::steady_clock::now();
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
@@ -1472,7 +1655,11 @@ bool VulkanRenderer::RenderSceneOffscreen(
         if (outError) *outError = "vkQueueSubmit failed in RenderSceneOffscreen";
         return false;
     }
+    auto tSub1 = std::chrono::steady_clock::now();
+
+    auto tWait0 = std::chrono::steady_clock::now();
     vkWaitForFences(dev, 1, &frameFences_[slot], VK_TRUE, UINT64_MAX);
+    auto tWait1 = std::chrono::steady_clock::now();
 
     if (timestampQueryPool_ != VK_NULL_HANDLE) {
         uint64_t timestamps[2]{0, 0};
@@ -1492,8 +1679,16 @@ bool VulkanRenderer::RenderSceneOffscreen(
         }
     }
 
-    auto t1 = std::chrono::high_resolution_clock::now();
+    auto t1 = std::chrono::steady_clock::now();
+    perfMetrics_.cpuSceneSyncMs = std::chrono::duration<double, std::milli>(tSync1 - tSync0).count();
+    perfMetrics_.cpuUiBuildMs = 0.0;
+    perfMetrics_.cpuCommandRecordMs = std::chrono::duration<double, std::milli>(tRec1 - tRec0).count();
+    perfMetrics_.cpuQueueSubmitMs = std::chrono::duration<double, std::milli>(tSub1 - tSub0).count();
+    perfMetrics_.cpuPresentWaitMs = std::chrono::duration<double, std::milli>(tWait1 - tWait0).count();
+    perfMetrics_.cpuActiveWorkMs =
+        perfMetrics_.cpuSceneSyncMs + perfMetrics_.cpuCommandRecordMs + perfMetrics_.cpuQueueSubmitMs;
     perfMetrics_.cpuFrameTimeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    perfMetrics_.presentModeName = "OFFSCREEN";
     ++perfMetrics_.renderedFrameCount;
     currentFrameSlot_ = (currentFrameSlot_ + 1) % VulkanContext::kMaxFramesInFlight;
     return true;
@@ -1517,11 +1712,13 @@ bool VulkanRenderer::RenderInteractiveFrame(
         return true;
     }
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
 
+    auto tSync0 = std::chrono::steady_clock::now();
     if (!EnsureProjectGpuResourcesSynced(project, activeObjects, outError)) {
         return false;
     }
+    auto tSync1 = std::chrono::steady_clock::now();
 
     if (swapchain_ == VK_NULL_HANDLE) {
         if (!CreateSwapchain(outError) || swapchain_ == VK_NULL_HANDLE) {
@@ -1529,6 +1726,7 @@ bool VulkanRenderer::RenderInteractiveFrame(
         }
     }
 
+    auto tWait0 = std::chrono::steady_clock::now();
     VkDevice dev = ctx_.GetDevice();
     uint32_t slot = currentFrameSlot_;
     vkWaitForFences(dev, 1, &frameFences_[slot], VK_TRUE, UINT64_MAX);
@@ -1561,6 +1759,8 @@ bool VulkanRenderer::RenderInteractiveFrame(
         imageAvailableSemaphores_[slot],
         VK_NULL_HANDLE,
         &swapchainImageIndex);
+    auto tWait1 = std::chrono::steady_clock::now();
+
     if (acqRes == VK_ERROR_OUT_OF_DATE_KHR) {
         vkDeviceWaitIdle(dev);
         CreateSwapchain(outError);
@@ -1573,6 +1773,7 @@ bool VulkanRenderer::RenderInteractiveFrame(
 
     vkResetFences(dev, 1, &frameFences_[slot]);
 
+    auto tUi0 = std::chrono::steady_clock::now();
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
@@ -1581,7 +1782,9 @@ bool VulkanRenderer::RenderInteractiveFrame(
     }
     ImGui::Render();
     ImDrawData* drawData = ImGui::GetDrawData();
+    auto tUi1 = std::chrono::steady_clock::now();
 
+    auto tRec0 = std::chrono::steady_clock::now();
     VkCommandBuffer cmd = frameCommandBuffers_[slot];
     vkResetCommandBuffer(cmd, 0);
 
@@ -1621,7 +1824,10 @@ bool VulkanRenderer::RenderInteractiveFrame(
     }
     vkCmdEndRendering(cmd);
 
-    if (swapchainSupportsTransferSrc_ && swapchainExtent_.width > 0 && swapchainExtent_.height > 0) {
+    // Only pay the ~8 MB swapchain GPU->Host copy cost when a screenshot capture was explicitly requested!
+    if (captureNextSwapchainFrame_ && swapchainSupportsTransferSrc_ &&
+        swapchainExtent_.width > 0 && swapchainExtent_.height > 0) {
+        captureNextSwapchainFrame_ = false;
         VkDeviceSize neededBytes = static_cast<VkDeviceSize>(swapchainExtent_.width) * swapchainExtent_.height * 4ULL;
         if (lastSwapchainCaptureBuffer_.buffer == VK_NULL_HANDLE || lastSwapchainCaptureBuffer_.size != neededBytes) {
             ctx_.DestroyBufferImmediate(lastSwapchainCaptureBuffer_);
@@ -1696,7 +1902,9 @@ bool VulkanRenderer::RenderInteractiveFrame(
     }
 
     vkEndCommandBuffer(cmd);
+    auto tRec1 = std::chrono::steady_clock::now();
 
+    auto tSub0 = std::chrono::steady_clock::now();
     VkSemaphore renderDoneSem = swapchainRenderFinishedSemaphores_[swapchainImageIndex];
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -1712,7 +1920,9 @@ bool VulkanRenderer::RenderInteractiveFrame(
         if (outError) *outError = "vkQueueSubmit failed in RenderInteractiveFrame";
         return false;
     }
+    auto tSub1 = std::chrono::steady_clock::now();
 
+    auto tPres0 = std::chrono::steady_clock::now();
     VkPresentInfoKHR presentInfo{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     presentInfo.waitSemaphoreCount = 1;
     presentInfo.pWaitSemaphores = &renderDoneSem;
@@ -1721,6 +1931,8 @@ bool VulkanRenderer::RenderInteractiveFrame(
     presentInfo.pImageIndices = &swapchainImageIndex;
 
     VkResult presRes = vkQueuePresentKHR(ctx_.GetGraphicsQueue(), &presentInfo);
+    auto tPres1 = std::chrono::steady_clock::now();
+
     if (presRes == VK_ERROR_OUT_OF_DATE_KHR || presRes == VK_SUBOPTIMAL_KHR) {
         vkDeviceWaitIdle(dev);
         CreateSwapchain(outError);
@@ -1729,7 +1941,19 @@ bool VulkanRenderer::RenderInteractiveFrame(
         hasPresentedSwapchainFrame_ = true;
     }
 
-    auto t1 = std::chrono::high_resolution_clock::now();
+    auto t1 = std::chrono::steady_clock::now();
+    perfMetrics_.cpuSceneSyncMs = std::chrono::duration<double, std::milli>(tSync1 - tSync0).count();
+    perfMetrics_.cpuUiBuildMs = std::chrono::duration<double, std::milli>(tUi1 - tUi0).count();
+    perfMetrics_.cpuCommandRecordMs = std::chrono::duration<double, std::milli>(tRec1 - tRec0).count();
+    perfMetrics_.cpuQueueSubmitMs = std::chrono::duration<double, std::milli>(tSub1 - tSub0).count();
+    perfMetrics_.cpuPresentWaitMs =
+        std::chrono::duration<double, std::milli>(tWait1 - tWait0).count() +
+        std::chrono::duration<double, std::milli>(tPres1 - tPres0).count();
+    perfMetrics_.cpuActiveWorkMs =
+        perfMetrics_.cpuSceneSyncMs +
+        perfMetrics_.cpuUiBuildMs +
+        perfMetrics_.cpuCommandRecordMs +
+        perfMetrics_.cpuQueueSubmitMs;
     perfMetrics_.cpuFrameTimeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
     ++perfMetrics_.renderedFrameCount;
     currentFrameSlot_ = (currentFrameSlot_ + 1) % VulkanContext::kMaxFramesInFlight;

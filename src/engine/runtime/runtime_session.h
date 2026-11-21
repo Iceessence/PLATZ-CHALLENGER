@@ -6,6 +6,10 @@
 #include <string>
 #include <vector>
 
+namespace platz::platform {
+class SpatialAudioEngine;
+}
+
 namespace platz::engine::runtime {
 
 struct LogicDiagnostic {
@@ -39,6 +43,8 @@ struct RuntimeExecutionMetrics {
     uint64_t collisionsResolvedCount{0};
     uint64_t conservedTransfersSucceeded{0};
     uint64_t conservedTransfersRolledBack{0};
+    uint64_t animationsEvaluatedCount{0};
+    uint64_t audioCuesTriggeredCount{0};
 };
 
 class RuntimeSession {
@@ -47,6 +53,15 @@ public:
 
     // Static validation of visual/no-code behavior rules before or during Play (PLZ-LOGIC-008, PLZ-CREATEX2-003, N-16)
     static std::vector<LogicDiagnostic> ValidateProjectLogic(const core::ProjectState& project);
+
+    // Deterministic unified animation track evaluator (used by both Play runtime and non-destructive Editor scrub preview)
+    static void EvaluateObjectAnimationAtTime(core::SceneObject& obj, double timeSec);
+
+    void AttachAudioEngine(platform::SpatialAudioEngine* audioEngine) { audioEngine_ = audioEngine; }
+    void SetAudioListener(const glm::vec3& position, const glm::vec3& rightDir) {
+        listenerPos_ = position;
+        listenerRight_ = rightDir;
+    }
 
     // Start isolated Play projection from canonical editor state (PLZ-RUNTIME-001, N-07)
     bool StartPlay(const core::ProjectState& canonicalProject, std::string* outError = nullptr);
@@ -109,6 +124,7 @@ private:
         const std::string& stateBefore);
     bool EvaluateRuleCondition(const core::SceneObject& self, const core::BehaviorRule& rule) const;
     void ExecuteRuleAction(core::SceneObject& self, const core::BehaviorRule& rule, double dt);
+    void TriggerSpatialCueIfConfigured(const core::SceneObject& obj, const std::string& overrideCue = "");
 
     bool playing_{false};
     bool paused_{false};
@@ -117,6 +133,10 @@ private:
     RuntimeExecutionMetrics metrics_{};
     std::vector<std::string> eventTraceLog_;
     std::vector<RuleDebuggerTimelineEntry> debuggerTimeline_;
+
+    platform::SpatialAudioEngine* audioEngine_{nullptr};
+    glm::vec3 listenerPos_{0.0f, 3.0f, 10.0f};
+    glm::vec3 listenerRight_{1.0f, 0.0f, 0.0f};
 };
 
 } // namespace platz::engine::runtime

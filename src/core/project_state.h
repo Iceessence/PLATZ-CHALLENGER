@@ -57,15 +57,17 @@ public:
 
     const std::filesystem::path& GetProjectDir() const { return projectDir_; }
     const std::string& GetProjectName() const { return projectName_; }
-    void SetProjectName(const std::string& name) { projectName_ = name; dirty_ = true; }
+    void SetProjectName(const std::string& name) { projectName_ = name; dirty_ = true; ++mutationGeneration_; }
     RevisionId GetHeadRevision() const { return headRevision_; }
     const std::string& GetActiveBranch() const { return activeBranch_; }
     void SetActiveBranch(const std::string& branch) { activeBranch_ = branch; }
     bool IsDirty() const { return dirty_; }
+    uint64_t GetMutationGeneration() const { return mutationGeneration_; }
+    void BumpMutationGeneration() { ++mutationGeneration_; }
 
     // Canonical object operations (all record scoped undo batches automatically unless recordUndo=false)
     const std::vector<SceneObject>& GetObjects() const { return objects_; }
-    std::vector<SceneObject>& GetObjectsMutable() { dirty_ = true; return objects_; }
+    std::vector<SceneObject>& GetObjectsMutable() { dirty_ = true; ++mutationGeneration_; return objects_; }
 
     SceneObject* FindObject(ObjectId id);
     const SceneObject* FindObject(ObjectId id) const;
@@ -146,6 +148,7 @@ private:
     std::string activeBranch_{"main"};
     RevisionId headRevision_{0};
     bool dirty_{false};
+    uint64_t mutationGeneration_{1};
 
     std::vector<SceneObject> objects_;
     std::vector<AssetMetadata> assets_;

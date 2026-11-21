@@ -1,0 +1,33 @@
+# Generated build & dependency cache outputs
+/out/
+/build/
+/cmake-build-*/
+
+# Machine-specific & IDE files
+.vs/
+.vscode/
+*.user
+*.suo
+*.aps
+*.pch
+*.ilk
+*.pdb
+*.exp
+*.lib
+*.dll
+*.exe
+*.obj
+*.o
+
+# Private credentials or keys
+*.pem
+*.key
+.env
+.env.*
+
+# Runtime temporary staging / crash recovery locks & local layout state
+*.tmp
+*.wal
+*.shm
+*.journal
+imgui.ini

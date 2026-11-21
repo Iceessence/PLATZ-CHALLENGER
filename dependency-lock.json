@@ -1,0 +1,169 @@
+{
+  "schema_version": "1.0.0",
+  "project": "PLATZ-CHALLENGER",
+  "locked_at_utc": "2026-11-21T16:20:00Z",
+  "host_environment": {
+    "os": "Windows 11 x64 (Windows SDK 10.0.26100.0)",
+    "compiler": "MSVC 19.51.36260 (Visual Studio 2026 Community 18.10.3+12224.181) / C++23",
+    "cmake": "4.3.1-msvc1",
+    "ninja": "1.13.2",
+    "primary_gpu": "NVIDIA GeForce RTX 5080 (Vulkan 1.4.351, Driver 617.42)",
+    "system_vulkan_loader": "1.4.341.0"
+  },
+  "dependencies": [
+    {
+      "name": "Vulkan-Headers",
+      "version": "1.4.363.0",
+      "tag": "vulkan-sdk-1.4.363.0",
+      "commit": "6802bb4733b63ed5efd3adb308a6c885ef180ea1",
+      "url": "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.363.0.zip",
+      "archive_name": "Vulkan-Headers-1.4.363.0.zip",
+      "sha256": "f4be95220ff0ee0b1c620301ff4fe9ae48592d71f4c30f2d5c571351a153ae81",
+      "license": "Apache-2.0 OR MIT",
+      "role": "Vulkan 1.4 C/C++ API headers"
+    },
+    {
+      "name": "volk",
+      "version": "1.4.363.0",
+      "tag": "vulkan-sdk-1.4.363.0",
+      "commit": "54fc0d7a72887cbfc5b030d26897b2b40ac53fb8",
+      "url": "https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.363.0.zip",
+      "archive_name": "volk-1.4.363.0.zip",
+      "sha256": "889b90fdcbe9cee7b118339d640c6895b7be5c920d309c44b744692063275b3d",
+      "license": "MIT",
+      "role": "Vulkan 1.4 dynamic meta-loader (avoids global LunarG SDK path mutation)"
+    },
+    {
+      "name": "VulkanMemoryAllocator",
+      "version": "3.5.0",
+      "tag": "v3.5.0",
+      "url": "https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/archive/refs/tags/v3.5.0.zip",
+      "archive_name": "VMA-3.5.0.zip",
+      "sha256": "9674db0a02fa45a55894c1d277d8474a4e0064459dc8b44afbbe83ce0a0dda46",
+      "license": "MIT",
+      "role": "Low-level GPU memory suballocation layer underneath PLATZ RAII resource & budget system"
+    },
+    {
+      "name": "SDL3",
+      "version": "3.4.20",
+      "tag": "release-3.4.20",
+      "url": "https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-devel-3.4.20-VC.zip",
+      "archive_name": "SDL3-devel-3.4.20-VC.zip",
+      "sha256": "1ec3009655ee37b1f73e52b3b120acc5afd8abaf9532f3303b1bf1dfe91b5969",
+      "license": "Zlib",
+      "role": "Window creation, input handling, high-DPI display scaling, clipboard, and Vulkan surface creation"
+    },
+    {
+      "name": "Slang",
+      "version": "2026.22.1",
+      "tag": "v2026.22.1",
+      "url": "https://github.com/shader-slang/slang/releases/download/v2026.22.1/slang-2026.22.1-windows-x86_64.zip",
+      "archive_name": "slang-2026.22.1-windows-x86_64.zip",
+      "sha256": "e72344f7b0323cec8b039c534caaf4680e7ba629489fc796ea4c7f7adb7deb68",
+      "license": "Apache-2.0 WITH LLVM-exception",
+      "role": "Primary shader compiler (Slang -> SPIR-V) with IR/SPIR-V validation and reflection"
+    },
+    {
+      "name": "SQLite",
+      "version": "3.54.1",
+      "tag": "3540100",
+      "url": "https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip",
+      "archive_name": "sqlite-amalgamation-3540100.zip",
+      "sha256": "0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9",
+      "sha3_256_upstream": "92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30",
+      "license": "Public Domain",
+      "role": "ACID transactional metadata, canonical object identity, revision history, and asset lineage database"
+    },
+    {
+      "name": "Dear ImGui (Docking)",
+      "version": "1.93.0-docking",
+      "tag": "v1.93.0-docking",
+      "commit": "b916186e66aa3c02b72c6ca17455516512ed8049",
+      "url": "https://github.com/ocornut/imgui/archive/refs/tags/v1.93.0-docking.zip",
+      "archive_name": "imgui-1.93.0-docking.zip",
+      "sha256": "302ccb19cf6ff803ebc970b4f96d59c95dd3a32169453ad5c503cab67c057992",
+      "license": "MIT",
+      "role": "Supporting docking/layout/text foundation beneath PLATZ Studio UI component & accessibility system"
+    },
+    {
+      "name": "GLM",
+      "version": "1.0.3",
+      "tag": "1.0.3",
+      "url": "https://github.com/g-truc/glm/archive/refs/tags/1.0.3.zip",
+      "archive_name": "glm-1.0.3.zip",
+      "sha256": "3aa4347b8f13cba882df1c7b61a6ca910c75a875c56ec3d75d7dc9ae8eac34df",
+      "license": "MIT",
+      "role": "3D linear algebra, quaternion, camera projection, and ray-picking math"
+    },
+    {
+      "name": "nlohmann_json",
+      "version": "3.12.0",
+      "tag": "v3.12.0",
+      "url": "https://github.com/nlohmann/json/releases/download/v3.12.0/json.hpp",
+      "archive_name": "json.hpp",
+      "sha256": "aaf127c04cb31c406e5b04a63f1ae89369fccde6d8fa7cdda1ed4f32dfc5de63",
+      "license": "MIT",
+      "role": "Structured serialization for component schemas, AI command diffs, and receipts"
+    },
+    {
+      "name": "doctest",
+      "version": "2.5.3",
+      "tag": "v2.5.3",
+      "url": "https://raw.githubusercontent.com/doctest/doctest/v2.5.3/doctest/doctest.h",
+      "archive_name": "doctest.h",
+      "sha256": "cfd518a3ef90f67e1f3ba514df23fb3627437de1a2feeba78cf5062a40021421",
+      "license": "MIT",
+      "role": "Unit, integration, graphics, and security CTest harness"
+    },
+    {
+      "name": "cgltf",
+      "version": "1.15-20260202",
+      "commit": "85cd62382dfea638278962690cf515023f33ed00",
+      "url": "https://raw.githubusercontent.com/jkuhlmann/cgltf/85cd62382dfea638278962690cf515023f33ed00/cgltf.h",
+      "archive_name": "cgltf.h",
+      "sha256": "efb169dee911696b5d35fc8e3f7ea0c56d679debc529eba9ca6aa6443ba9d5e9",
+      "license": "MIT",
+      "role": "glTF 2.0 (.gltf/.glb) 3D asset import and parsing"
+    },
+    {
+      "name": "tinyobjloader",
+      "version": "2.0.0rc13-20261117",
+      "commit": "bbcf7570374b1aac2e646e9ad09625bbb41caa3f",
+      "url": "https://raw.githubusercontent.com/tinyobjloader/tinyobjloader/bbcf7570374b1aac2e646e9ad09625bbb41caa3f/tiny_obj_loader.h",
+      "archive_name": "tiny_obj_loader.h",
+      "sha256": "cffc9c8746541bd14a3ba877cd3c52cb7ccfe3779b1d5863f7d13f05d26f1ef8",
+      "license": "MIT",
+      "role": "Wavefront .obj 3D mesh and .mtl material import"
+    },
+    {
+      "name": "stb_image",
+      "version": "2.30-20261119",
+      "commit": "6b5799bae8a1fe3792691ef4b72ae26434c3e799",
+      "url": "https://raw.githubusercontent.com/nothings/stb/6b5799bae8a1fe3792691ef4b72ae26434c3e799/stb_image.h",
+      "archive_name": "stb_image.h",
+      "sha256": "dfc2aadda6295f67f677587773f25e5bf8c8ad427ed0db7c518525c91e72e020",
+      "license": "MIT OR Public Domain",
+      "role": "2D texture loading (PNG/JPEG/TGA/BMP) for PBR materials"
+    },
+    {
+      "name": "stb_image_write",
+      "version": "1.16-20261119",
+      "commit": "6b5799bae8a1fe3792691ef4b72ae26434c3e799",
+      "url": "https://raw.githubusercontent.com/nothings/stb/6b5799bae8a1fe3792691ef4b72ae26434c3e799/stb_image_write.h",
+      "archive_name": "stb_image_write.h",
+      "sha256": "5d89edc8bffd848f3e138b2a1dbec67aadbed591894bde16ade7c83dc233af9b",
+      "license": "MIT OR Public Domain",
+      "role": "Offscreen Vulkan framebuffer verification export and texture baking output"
+    },
+    {
+      "name": "Vulkan-ValidationLayers",
+      "version": "1.4.363-windows-x64",
+      "tag": "nightly",
+      "url": "https://github.com/KhronosGroup/Vulkan-ValidationLayers/releases/download/nightly/Validation_Layers_Windows_64.zip",
+      "archive_name": "Validation_Layers_Windows_64.zip",
+      "sha256": "423d9ef576925d757894b80f055d19aab2a00cb832f38585fc18f20e0db15208",
+      "license": "Apache-2.0",
+      "role": "Isolated Khronos Vulkan validation layer binary loaded via VK_ADD_LAYER_PATH"
+    }
+  ]
+}

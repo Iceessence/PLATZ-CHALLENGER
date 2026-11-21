@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/object_identity.h"
+
 #include <cstdint>
 #include <span>
 #include <string>
@@ -27,6 +29,17 @@ struct Aabb3D {
         float* outDistance) const;
 };
 
+struct MeshValidationReport {
+    bool valid{false};
+    uint32_t vertexCount{0};
+    uint32_t triangleCount{0};
+    uint32_t degenerateTriangleCount{0};
+    uint32_t outOfBoundsIndexCount{0};
+    uint32_t nonFiniteVertexCount{0};
+    glm::vec3 dimensions{0.0f};
+    std::string diagnostic;
+};
+
 struct MeshData {
     std::string name{"Mesh"};
     std::vector<Vertex3D> vertices;
@@ -34,7 +47,9 @@ struct MeshData {
     Aabb3D localBounds;
 
     void RecomputeBounds();
+    void RecomputeSmoothNormals();
     bool ValidateTopology(std::string* outDiagnostic = nullptr) const;
+    MeshValidationReport AnalyzeMeshQuality() const;
 
     // Binary format serialization for PLATZ content-addressed asset store (.blob)
     std::vector<uint8_t> SerializeToBinaryBlob() const;
@@ -55,8 +70,16 @@ public:
     // Line-list reference grid for 3D Studio viewport
     static MeshData GenerateWorldGridLines(int halfExtent = 40, float step = 1.0f);
 
-    // Non-destructive parametric subdivision modifier (PLZ-MODEL-005)
+    // Non-destructive parametric modifiers & ordered stack evaluator (PLZ-MODEL-001, PLZ-MODEL-004, PLZ-MODEL-005)
     static MeshData ApplySubdivisionModifier(const MeshData& source);
+    static MeshData ApplyBevelChamferModifier(const MeshData& source, float chamferAmount = 0.12f);
+    static MeshData ApplyTaperTwistModifier(const MeshData& source, float twistAngleDeg = 45.0f, float taperFactor = 0.65f);
+    static MeshData ApplyMirrorXModifier(const MeshData& source, float mirrorOffset = 0.75f);
+    static MeshData ApplyVertexNoiseDisplaceModifier(const MeshData& source, float amplitude = 0.08f, float frequency = 3.0f, uint32_t seed = 2026u);
+
+    static MeshData EvaluateModifierStack(
+        const MeshData& baseMesh,
+        const std::vector<core::MeshModifier>& stack);
 };
 
 } // namespace platz::creative

@@ -43,7 +43,7 @@ bool TransformComponent::IsFinite() const {
     if (std::abs(scale.x) < 1e-5f || std::abs(scale.y) < 1e-5f || std::abs(scale.z) < 1e-5f) {
         return false;
     }
-    if ( std::abs(position.x) > 1e6f || std::abs(position.y) > 1e6f || std::abs(position.z) > 1e6f) {
+    if (std::abs(position.x) > 1e6f || std::abs(position.y) > 1e6f || std::abs(position.z) > 1e6f) {
         return false;
     }
     return true;
@@ -108,6 +108,18 @@ static glm::vec4 JsonToVec4(const nlohmann::json& j, const glm::vec4& defVal = g
 }
 
 nlohmann::json SceneObject::ToJson() const {
+    nlohmann::json modsJson = nlohmann::json::array();
+    for (const auto& m : mesh.modifierStack) {
+        modsJson.push_back({
+            {"modifierId", m.modifierId},
+            {"modifierType", m.modifierType},
+            {"enabled", m.enabled},
+            {"paramA", m.paramA},
+            {"paramB", m.paramB},
+            {"seed", m.seed}
+        });
+    }
+
     nlohmann::json rulesJson = nlohmann::json::array();
     for (const auto& r : logic.rules) {
         rulesJson.push_back({
@@ -141,7 +153,8 @@ nlohmann::json SceneObject::ToJson() const {
             {"primitiveType", mesh.primitiveType},
             {"meshAssetId", mesh.meshAssetId},
             {"castShadows", mesh.castShadows},
-            {"visible", mesh.visible}
+            {"visible", mesh.visible},
+            {"modifierStack", modsJson}
         }},
         {"material", {
             {"materialName", material.materialName},
@@ -152,7 +165,8 @@ nlohmann::json SceneObject::ToJson() const {
             {"emissiveStrength", material.emissiveStrength},
             {"normalScale", material.normalScale},
             {"useProceduralChecker", material.useProceduralChecker},
-            {"albedoTextureAssetId", material.albedoTextureAssetId}
+            {"albedoTextureAssetId", material.albedoTextureAssetId},
+            {"materialGraphJson", material.materialGraphJson}
         }},
         {"light", {
             {"enabled", light.enabled},
@@ -204,6 +218,18 @@ SceneObject SceneObject::FromJson(const nlohmann::json& j) {
         obj.mesh.meshAssetId = m.value("meshAssetId", AssetId{0});
         obj.mesh.castShadows = m.value("castShadows", true);
         obj.mesh.visible = m.value("visible", true);
+        if (m.contains("modifierStack") && m["modifierStack"].is_array()) {
+            for (const auto& mj : m["modifierStack"]) {
+                MeshModifier mod;
+                mod.modifierId = mj.value("modifierId", std::string("mod_1"));
+                mod.modifierType = mj.value("modifierType", std::string("Subdivide"));
+                mod.enabled = mj.value("enabled", true);
+                mod.paramA = mj.value("paramA", 0.25f);
+                mod.paramB = mj.value("paramB", 1.0f);
+                mod.seed = mj.value("seed", 2026u);
+                obj.mesh.modifierStack.push_back(std::move(mod));
+            }
+        }
     }
     if (j.contains("material")) {
         const auto& mat = j["material"];
@@ -216,6 +242,7 @@ SceneObject SceneObject::FromJson(const nlohmann::json& j) {
         obj.material.normalScale = mat.value("normalScale", 1.0f);
         obj.material.useProceduralChecker = mat.value("useProceduralChecker", false);
         obj.material.albedoTextureAssetId = mat.value("albedoTextureAssetId", AssetId{0});
+        obj.material.materialGraphJson = mat.value("materialGraphJson", std::string(""));
     }
     if (j.contains("light")) {
         const auto& l = j["light"];

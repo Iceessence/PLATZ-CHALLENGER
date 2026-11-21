@@ -8,7 +8,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <sstream>
 
 namespace platz::engine::vulkan {
 
@@ -44,6 +47,19 @@ void TransitionImageLayout2(
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
+}
+
+std::string ComputeModifierStackSignature(
+    const std::string& primitiveType,
+    core::AssetId meshAssetId,
+    const std::vector<core::MeshModifier>& stack) {
+    std::ostringstream oss;
+    oss << primitiveType << ":" << meshAssetId << ":";
+    for (const auto& m : stack) {
+        if (!m.enabled) continue;
+        oss << m.modifierType << "(" << m.paramA << "," << m.paramB << "," << m.seed << ");";
+    }
+    return oss.str();
 }
 
 } // namespace
@@ -97,7 +113,6 @@ bool VulkanRenderer::Initialize(
         return false;
     }
 
-    // Frame command pool, command buffers, fences, semaphores, and uniform buffers
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = ctx_.GetGraphicsQueueFamily();
@@ -152,12 +167,19 @@ bool VulkanRenderer::Initialize(
         return false;
     }
 
-    if (!UploadMeshToGpu(creative::MeshGenerator::GenerateCube(1.0f), &primitiveMeshes_["cube"], outError) ||
-        !UploadMeshToGpu(creative::MeshGenerator::GenerateSphere(0.6f, 28, 18), &primitiveMeshes_["sphere"], outError) ||
-        !UploadMeshToGpu(creative::MeshGenerator::GenerateCylinder(0.5f, 1.2f, 24), &primitiveMeshes_["cylinder"], outError) ||
-        !UploadMeshToGpu(creative::MeshGenerator::GeneratePlane(10.0f, 10.0f, 4.0f), &primitiveMeshes_["plane"], outError) ||
-        !UploadMeshToGpu(creative::MeshGenerator::GenerateTorus(0.65f, 0.22f, 32, 16), &primitiveMeshes_["torus"], outError) ||
-        !UploadMeshToGpu(creative::MeshGenerator::GenerateWorldGridLines(30, 1.0f), &worldGridMesh_, outError)) {
+    cpuPrimitiveBaseMeshes_["cube"] = creative::MeshGenerator::GenerateCube(1.0f);
+    cpuPrimitiveBaseMeshes_["sphere"] = creative::MeshGenerator::GenerateSphere(0.6f, 28, 18);
+    cpuPrimitiveBaseMeshes_["cylinder"] = creative::MeshGenerator::GenerateCylinder(0.5f, 1.2f, 24);
+    cpuPrimitiveBaseMeshes_["plane"] = creative::MeshGenerator::GeneratePlane(10.0f, 10.0f, 4.0f);
+    cpuPrimitiveBaseMeshes_["torus"] = creative::MeshGenerator::GenerateTorus(0.65f, 0.22f, 32, 16);
+
+    for (const auto& [name, meshData] : cpuPrimitiveBaseMeshes_) {
+        if (!UploadMeshToGpu(meshData, &primitiveMeshes_[name], outError)) {
+            Shutdown();
+            return false;
+        }
+    }
+    if (!UploadMeshToGpu(creative::MeshGenerator::GenerateWorldGridLines(30, 1.0f), &worldGridMesh_, outError)) {
         Shutdown();
         return false;
     }
@@ -183,6 +205,30 @@ bool VulkanRenderer::Initialize(
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+        io.IniFilename = nullptr; // Programmatic DockBuilder manages consistent recoverable workspace layouts
+
+        // Load high-DPI crisp TrueType system typography (Segoe UI + Consolas)
+        ImFontConfig fontCfg{};
+        fontCfg.OversampleH = 3;
+        fontCfg.OversampleV = 2;
+        fontCfg.PixelSnapH = true;
+
+        std::filesystem::path winFonts("C:/Windows/Fonts");
+        std::error_code ec;
+        if (std::filesystem::exists(winFonts / "segoeui.ttf", ec)) {
+            fontRegular_ = io.Fonts->AddFontFromFileTTF((winFonts / "segoeui.ttf").string().c_str(), 16.0f, &fontCfg);
+        }
+        if (std::filesystem::exists(winFonts / "segoeuib.ttf", ec)) {
+            fontBold_ = io.Fonts->AddFontFromFileTTF((winFonts / "segoeuib.ttf").string().c_str(), 17.5f, &fontCfg);
+        }
+        if (std::filesystem::exists(winFonts / "consola.ttf", ec)) {
+            fontMono_ = io.Fonts->AddFontFromFileTTF((winFonts / "consola.ttf").string().c_str(), 14.5f, &fontCfg);
+        }
+        if (!fontRegular_) {
+            fontRegular_ = io.Fonts->AddFontDefault();
+        }
+        if (!fontBold_) fontBold_ = fontRegular_;
+        if (!fontMono_) fontMono_ = fontRegular_;
 
         ImGui_ImplSDL3_InitForVulkan(window_->GetNativeHandle());
 
@@ -197,7 +243,7 @@ bool VulkanRenderer::Initialize(
         initInfo.Device = ctx_.GetDevice();
         initInfo.QueueFamily = ctx_.GetGraphicsQueueFamily();
         initInfo.Queue = ctx_.GetGraphicsQueue();
-        initInfo.DescriptorPoolSize = 32;
+        initInfo.DescriptorPoolSize = 64;
         initInfo.MinImageCount = 2;
         initInfo.ImageCount = std::max(2u, static_cast<uint32_t>(swapchainImages_.size()));
         initInfo.UseDynamicRendering = true;
@@ -215,6 +261,13 @@ bool VulkanRenderer::Initialize(
             linearSampler_,
             offscreenColor_.view,
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        // Initialize 2D Pixel-Art and Material Graph preview textures
+        creative::PixelArtCanvas defaultPixelCanvas(16, 16);
+        UpdatePixelArtPreviewTexture(defaultPixelCanvas.BakeToImageData2D());
+
+        creative::MaterialGraphDocument defaultMatGraph;
+        UpdateMaterialGraphPreviewTexture(defaultMatGraph.BakeGraphAlbedoTexture(128, 128));
     }
 
     initialized_ = true;
@@ -230,6 +283,14 @@ void VulkanRenderer::Shutdown() {
         if (viewportImGuiDescriptorSet_ != VK_NULL_HANDLE) {
             ImGui_ImplVulkan_RemoveTexture(viewportImGuiDescriptorSet_);
             viewportImGuiDescriptorSet_ = VK_NULL_HANDLE;
+        }
+        if (pixelArtPreviewTexture_.imguiDescriptorSet != VK_NULL_HANDLE) {
+            ImGui_ImplVulkan_RemoveTexture(pixelArtPreviewTexture_.imguiDescriptorSet);
+            pixelArtPreviewTexture_.imguiDescriptorSet = VK_NULL_HANDLE;
+        }
+        if (materialGraphPreviewTexture_.imguiDescriptorSet != VK_NULL_HANDLE) {
+            ImGui_ImplVulkan_RemoveTexture(materialGraphPreviewTexture_.imguiDescriptorSet);
+            materialGraphPreviewTexture_.imguiDescriptorSet = VK_NULL_HANDLE;
         }
         ImGui_ImplVulkan_Shutdown();
         ImGui_ImplSDL3_Shutdown();
@@ -255,9 +316,18 @@ void VulkanRenderer::Shutdown() {
         }
         customAssetMeshes_.clear();
 
+        for (auto& [id, m] : modifiedObjectMeshes_) {
+            ctx_.DestroyBufferImmediate(m.vertexBuffer);
+            ctx_.DestroyBufferImmediate(m.indexBuffer);
+        }
+        modifiedObjectMeshes_.clear();
+
         ctx_.DestroyBufferImmediate(worldGridMesh_.vertexBuffer);
         ctx_.DestroyBufferImmediate(worldGridMesh_.indexBuffer);
         ctx_.DestroyImageImmediate(defaultCalibrationTexture_.image);
+        ctx_.DestroyImageImmediate(pixelArtPreviewTexture_.image);
+        ctx_.DestroyImageImmediate(materialGraphPreviewTexture_.image);
+        ctx_.DestroyBufferImmediate(lastSwapchainCaptureBuffer_);
 
         for (uint32_t i = 0; i < VulkanContext::kMaxFramesInFlight; ++i) {
             ctx_.DestroyBufferImmediate(sceneUniformBuffers_[i]);
@@ -299,6 +369,44 @@ void VulkanRenderer::Shutdown() {
 
     ctx_.Shutdown();
     initialized_ = false;
+}
+
+bool VulkanRenderer::UpdatePixelArtPreviewTexture(const creative::ImageData2D& spriteImg, std::string* outError) {
+    if (imguiInitialized_ && pixelArtPreviewTexture_.imguiDescriptorSet != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(ctx_.GetDevice());
+        ImGui_ImplVulkan_RemoveTexture(pixelArtPreviewTexture_.imguiDescriptorSet);
+        pixelArtPreviewTexture_.imguiDescriptorSet = VK_NULL_HANDLE;
+    }
+    creative::ImageData2D exactImg = creative::TextureGenerator::SampleNearestNeighborExact(spriteImg, 8);
+    exactImg.pixelExactNearest = true;
+    if (!UploadTextureToGpu(exactImg, &pixelArtPreviewTexture_, outError)) {
+        return false;
+    }
+    if (imguiInitialized_) {
+        pixelArtPreviewTexture_.imguiDescriptorSet = ImGui_ImplVulkan_AddTexture(
+            nearestSampler_,
+            pixelArtPreviewTexture_.image.view,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    return true;
+}
+
+bool VulkanRenderer::UpdateMaterialGraphPreviewTexture(const creative::ImageData2D& graphImg, std::string* outError) {
+    if (imguiInitialized_ && materialGraphPreviewTexture_.imguiDescriptorSet != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(ctx_.GetDevice());
+        ImGui_ImplVulkan_RemoveTexture(materialGraphPreviewTexture_.imguiDescriptorSet);
+        materialGraphPreviewTexture_.imguiDescriptorSet = VK_NULL_HANDLE;
+    }
+    if (!UploadTextureToGpu(graphImg, &materialGraphPreviewTexture_, outError)) {
+        return false;
+    }
+    if (imguiInitialized_) {
+        materialGraphPreviewTexture_.imguiDescriptorSet = ImGui_ImplVulkan_AddTexture(
+            linearSampler_,
+            materialGraphPreviewTexture_.image.view,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    return true;
 }
 
 bool VulkanRenderer::CreateOffscreenTargets(uint32_t width, uint32_t height, std::string* outError) {
@@ -408,7 +516,7 @@ bool VulkanRenderer::CreateSwapchain(std::string* outError) {
     }
     swapchainFormat_ = chosenFormat.format;
 
-    int winW = 1280, winH = 720;
+    int winW = 1600, winH = 920;
     window_->GetPixelSize(&winW, &winH);
     if (surfCaps.currentExtent.width != UINT32_MAX && surfCaps.currentExtent.width > 0) {
         swapchainExtent_ = surfCaps.currentExtent;
@@ -418,13 +526,15 @@ bool VulkanRenderer::CreateSwapchain(std::string* outError) {
     }
 
     if (swapchainExtent_.width == 0 || swapchainExtent_.height == 0) {
-        return true; // Window is minimized
+        return true;
     }
 
     uint32_t imageCount = std::max(2u, surfCaps.minImageCount + 1);
     if (surfCaps.maxImageCount > 0 && imageCount > surfCaps.maxImageCount) {
         imageCount = surfCaps.maxImageCount;
     }
+
+    swapchainSupportsTransferSrc_ = ((surfCaps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0);
 
     VkSwapchainCreateInfoKHR scInfo{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     scInfo.surface = surface;
@@ -433,7 +543,8 @@ bool VulkanRenderer::CreateSwapchain(std::string* outError) {
     scInfo.imageColorSpace = chosenFormat.colorSpace;
     scInfo.imageExtent = swapchainExtent_;
     scInfo.imageArrayLayers = 1;
-    scInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    scInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                        (swapchainSupportsTransferSrc_ ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
     scInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     scInfo.preTransform = surfCaps.currentTransform;
     scInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -473,6 +584,7 @@ bool VulkanRenderer::CreateSwapchain(std::string* outError) {
         }
     }
 
+    hasPresentedSwapchainFrame_ = false;
     return true;
 }
 
@@ -492,12 +604,12 @@ void VulkanRenderer::DestroySwapchain() {
         vkDestroySwapchainKHR(dev, swapchain_, nullptr);
         swapchain_ = VK_NULL_HANDLE;
     }
+    hasPresentedSwapchainFrame_ = false;
 }
 
 bool VulkanRenderer::CreateDescriptorsAndPipelines(std::string* outError) {
     VkDevice dev = ctx_.GetDevice();
 
-    // Descriptor Set Layout: Binding 0 = SceneUniforms UBO, Binding 1 = Combined Image Sampler (Albedo texture)
     VkDescriptorSetLayoutBinding bindings[2]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -589,7 +701,6 @@ bool VulkanRenderer::CreateDescriptorsAndPipelines(std::string* outError) {
         return false;
     }
 
-    // Load or compile Slang -> SPIR-V shaders
     std::filesystem::path binShaderDir =
 #ifdef PLATZ_BINARY_DIR
         std::filesystem::path(PLATZ_BINARY_DIR) / "shaders";
@@ -702,7 +813,6 @@ bool VulkanRenderer::BuildGraphicsPipelinesFromStages(
     dsInfo.depthWriteEnable = VK_TRUE;
     dsInfo.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
-    // 2 Color Attachments: Attachment 0 = R8G8B8A8_UNORM Color, Attachment 1 = R32_UINT Object ID (no blending on integer target!)
     VkPipelineColorBlendAttachmentState blendAtts[2]{};
     blendAtts[0].colorWriteMask =
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -799,7 +909,6 @@ bool VulkanRenderer::HotReloadPbrShaderFromSlangSource(
     const std::string& slangSourceCode,
     std::string* outDiagnostic) {
     if (!shaderCompiler_.HotReloadSlangSource("pbr_surface", slangSourceCode, "vsMain", "fsMain", outDiagnostic)) {
-        // Safe fallback: active pbrPipeline_ remains intact (N-13)
         return false;
     }
     CompiledShaderStage pbrV, pbrF, gridV, gridF;
@@ -998,9 +1107,19 @@ void VulkanRenderer::InvalidateDerivedGpuCaches() {
         ctx_.DeferDestroyBuffer(currentFrameSlot_, res.indexBuffer);
     }
     customAssetMeshes_.clear();
+
+    for (auto& [id, res] : modifiedObjectMeshes_) {
+        ctx_.DeferDestroyBuffer(currentFrameSlot_, res.vertexBuffer);
+        ctx_.DeferDestroyBuffer(currentFrameSlot_, res.indexBuffer);
+    }
+    modifiedObjectMeshes_.clear();
 }
 
-bool VulkanRenderer::EnsureProjectGpuResourcesSynced(const core::ProjectState& project, std::string* outError) {
+bool VulkanRenderer::EnsureProjectGpuResourcesSynced(
+    const core::ProjectState& project,
+    const std::vector<core::SceneObject>& activeObjects,
+    std::string* outError) {
+    // 1. Sync content-addressed custom mesh assets
     for (const auto& ast : project.GetAssets()) {
         if (ast.assetType != "mesh") continue;
         auto it = customAssetMeshes_.find(ast.assetId);
@@ -1024,6 +1143,48 @@ bool VulkanRenderer::EnsureProjectGpuResourcesSynced(const core::ProjectState& p
         customAssetMeshes_[ast.assetId] = std::move(gpuRes);
         ++perfMetrics_.rebuiltCacheCount;
     }
+
+    // 2. Sync per-object non-destructive Modifier Stack derived GPU meshes (PLZ-MODEL-005, PLZ-ARCH-004)
+    for (const auto& obj : activeObjects) {
+        if (obj.mesh.modifierStack.empty()) {
+            auto it = modifiedObjectMeshes_.find(obj.id);
+            if (it != modifiedObjectMeshes_.end()) {
+                ctx_.DeferDestroyBuffer(currentFrameSlot_, it->second.vertexBuffer);
+                ctx_.DeferDestroyBuffer(currentFrameSlot_, it->second.indexBuffer);
+                modifiedObjectMeshes_.erase(it);
+            }
+            continue;
+        }
+
+        std::string sig = ComputeModifierStackSignature(obj.mesh.primitiveType, obj.mesh.meshAssetId, obj.mesh.modifierStack);
+        auto it = modifiedObjectMeshes_.find(obj.id);
+        if (it != modifiedObjectMeshes_.end() && it->second.modifierSignature == sig) {
+            continue;
+        }
+
+        creative::MeshData baseMesh;
+        auto primIt = cpuPrimitiveBaseMeshes_.find(obj.mesh.primitiveType);
+        if (primIt != cpuPrimitiveBaseMeshes_.end()) {
+            baseMesh = primIt->second;
+        } else {
+            baseMesh = cpuPrimitiveBaseMeshes_["cube"];
+        }
+
+        creative::MeshData evaluated = creative::MeshGenerator::EvaluateModifierStack(baseMesh, obj.mesh.modifierStack);
+        evaluated.name = obj.name + "_ModStack";
+        GpuMeshResource gpuMod{};
+        if (!UploadMeshToGpu(evaluated, &gpuMod, outError)) {
+            return false;
+        }
+        gpuMod.modifierSignature = sig;
+        if (it != modifiedObjectMeshes_.end()) {
+            ctx_.DeferDestroyBuffer(currentFrameSlot_, it->second.vertexBuffer);
+            ctx_.DeferDestroyBuffer(currentFrameSlot_, it->second.indexBuffer);
+        }
+        modifiedObjectMeshes_[obj.id] = std::move(gpuMod);
+        ++perfMetrics_.rebuiltCacheCount;
+    }
+
     return true;
 }
 
@@ -1034,18 +1195,23 @@ void VulkanRenderer::RecordOffscreenScenePass(
     const core::ProjectState& project,
     const scene::ViewportCamera& camera,
     core::ObjectId selectedObjectId) {
-    // Update SceneUniforms from camera and scene lights
     float aspect = static_cast<float>(viewportWidth_) / static_cast<float>(std::max(1u, viewportHeight_));
     GpuSceneUniforms ubo{};
     ubo.viewProj = camera.GetViewProjectionMatrix(aspect);
     ubo.cameraPos = glm::vec4(camera.GetEyePosition(), camera.GetExposure());
 
-    // Look for directional and point lights in activeObjects
+    float azRad = glm::radians(sunAzimuthDeg_);
+    float elRad = glm::radians(sunElevationDeg_);
+    glm::vec3 defaultSunDir = glm::normalize(glm::vec3(
+        std::cos(elRad) * std::sin(azRad),
+        std::sin(elRad),
+        std::cos(elRad) * std::cos(azRad)));
+    ubo.sunDirection = glm::vec4(defaultSunDir, 2.9f);
+
     for (const auto& obj : activeObjects) {
         if (!obj.visible || !obj.light.enabled) continue;
         if (obj.light.lightType == "directional") {
-            glm::vec3 dir = glm::normalize(glm::vec3(0.45f, 0.82f, 0.35f) + obj.transform.position * 0.05f);
-            ubo.sunDirection = glm::vec4(dir, obj.light.intensity);
+            ubo.sunDirection = glm::vec4(defaultSunDir, obj.light.intensity);
             ubo.sunColor = glm::vec4(obj.light.color, 0.35f);
         } else if (obj.light.lightType == "point") {
             ubo.pointLightPos = glm::vec4(obj.transform.position, std::max(1.0f, obj.light.range));
@@ -1060,7 +1226,6 @@ void VulkanRenderer::RecordOffscreenScenePass(
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampQueryPool_, queryBase);
     }
 
-    // Synchronization2 layout transitions for offscreen color, object-ID, and depth targets
     TransitionImageLayout2(
         cmd,
         offscreenColor_.image,
@@ -1143,7 +1308,6 @@ void VulkanRenderer::RecordOffscreenScenePass(
     uint32_t drawCalls = 0;
     uint32_t triangles = 0;
 
-    // 1. Draw 3D World Reference Grid
     if (gridPipeline_ != VK_NULL_HANDLE && worldGridMesh_.indexCount > 0) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gridPipeline_);
         VkDeviceSize offset = 0;
@@ -1153,7 +1317,6 @@ void VulkanRenderer::RecordOffscreenScenePass(
         ++drawCalls;
     }
 
-    // 2. Draw all visible 3D Scene Objects with Slang PBR pipeline
     if (pbrPipeline_ != VK_NULL_HANDLE) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pbrPipeline_);
 
@@ -1168,7 +1331,11 @@ void VulkanRenderer::RecordOffscreenScenePass(
             if (!obj.visible || !obj.mesh.visible) continue;
 
             const GpuMeshResource* gpuMesh = nullptr;
-            if (obj.mesh.primitiveType == "custom_asset" && obj.mesh.meshAssetId != 0) {
+            auto modIt = modifiedObjectMeshes_.find(obj.id);
+            if (modIt != modifiedObjectMeshes_.end() && modIt->second.indexCount > 0) {
+                gpuMesh = &modIt->second;
+            }
+            if (!gpuMesh && obj.mesh.primitiveType == "custom_asset" && obj.mesh.meshAssetId != 0) {
                 auto it = customAssetMeshes_.find(obj.mesh.meshAssetId);
                 if (it != customAssetMeshes_.end()) {
                     gpuMesh = &it->second;
@@ -1184,7 +1351,6 @@ void VulkanRenderer::RecordOffscreenScenePass(
             }
             if (!gpuMesh || gpuMesh->indexCount == 0) continue;
 
-            // Compute hierarchy world matrix from activeObjects
             glm::mat4 worldMat = obj.transform.ToLocalMatrix();
             core::ObjectId pid = obj.parentId;
             int guard = 0;
@@ -1233,8 +1399,6 @@ void VulkanRenderer::RecordOffscreenScenePass(
 
     vkCmdEndRendering(cmd);
 
-    // Transition offscreen color to SHADER_READ_ONLY_OPTIMAL (for ImGui viewport display & readback)
-    // and offscreenObjectId to TRANSFER_SRC_OPTIMAL (for GPU picking readback)
     TransitionImageLayout2(
         cmd,
         offscreenColor_.image,
@@ -1279,7 +1443,7 @@ bool VulkanRenderer::RenderSceneOffscreen(
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    if (!EnsureProjectGpuResourcesSynced(project, outError)) {
+    if (!EnsureProjectGpuResourcesSynced(project, activeObjects, outError)) {
         return false;
     }
 
@@ -1355,7 +1519,7 @@ bool VulkanRenderer::RenderInteractiveFrame(
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    if (!EnsureProjectGpuResourcesSynced(project, outError)) {
+    if (!EnsureProjectGpuResourcesSynced(project, activeObjects, outError)) {
         return false;
     }
 
@@ -1369,7 +1533,6 @@ bool VulkanRenderer::RenderInteractiveFrame(
     uint32_t slot = currentFrameSlot_;
     vkWaitForFences(dev, 1, &frameFences_[slot], VK_TRUE, UINT64_MAX);
 
-    // Read previous frame's GPU timestamp query before resetting
     if (timestampQueryPool_ != VK_NULL_HANDLE && perfMetrics_.renderedFrameCount >= VulkanContext::kMaxFramesInFlight) {
         uint64_t ts[2]{0, 0};
         if (vkGetQueryPoolResults(
@@ -1410,7 +1573,6 @@ bool VulkanRenderer::RenderInteractiveFrame(
 
     vkResetFences(dev, 1, &frameFences_[slot]);
 
-    // Build Dear ImGui Docking UI for this frame
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
@@ -1427,10 +1589,8 @@ bool VulkanRenderer::RenderInteractiveFrame(
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
-    // Pass 1: Render 3D Scene to Offscreen Viewport Targets
     RecordOffscreenScenePass(cmd, slot, activeObjects, project, camera, selectedObjectId);
 
-    // Pass 2: Render PLATZ Studio UI (including the sampled 3D Viewport Texture) into Swapchain Image
     TransitionImageLayout2(
         cmd,
         swapchainImages_[swapchainImageIndex],
@@ -1447,7 +1607,7 @@ bool VulkanRenderer::RenderInteractiveFrame(
     scAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     scAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     scAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    scAtt.clearValue.color = {{0.06f, 0.07f, 0.09f, 1.0f}};
+    scAtt.clearValue.color = {{0.055f, 0.065f, 0.085f, 1.0f}};
 
     VkRenderingInfo scRenderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
     scRenderInfo.renderArea = {{0, 0}, swapchainExtent_};
@@ -1461,16 +1621,79 @@ bool VulkanRenderer::RenderInteractiveFrame(
     }
     vkCmdEndRendering(cmd);
 
-    TransitionImageLayout2(
-        cmd,
-        swapchainImages_[swapchainImageIndex],
-        VK_IMAGE_ASPECT_COLOR_BIT,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-        0);
+    if (swapchainSupportsTransferSrc_ && swapchainExtent_.width > 0 && swapchainExtent_.height > 0) {
+        VkDeviceSize neededBytes = static_cast<VkDeviceSize>(swapchainExtent_.width) * swapchainExtent_.height * 4ULL;
+        if (lastSwapchainCaptureBuffer_.buffer == VK_NULL_HANDLE || lastSwapchainCaptureBuffer_.size != neededBytes) {
+            ctx_.DestroyBufferImmediate(lastSwapchainCaptureBuffer_);
+            ctx_.CreateBuffer(
+                neededBytes,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VMA_MEMORY_USAGE_AUTO,
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                "SwapchainFrameCaptureBuffer",
+                &lastSwapchainCaptureBuffer_,
+                nullptr);
+        }
+        if (lastSwapchainCaptureBuffer_.buffer != VK_NULL_HANDLE) {
+            TransitionImageLayout2(
+                cmd,
+                swapchainImages_[swapchainImageIndex],
+                VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                VK_ACCESS_2_TRANSFER_READ_BIT);
+
+            VkBufferImageCopy region{};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {swapchainExtent_.width, swapchainExtent_.height, 1};
+            vkCmdCopyImageToBuffer(
+                cmd,
+                swapchainImages_[swapchainImageIndex],
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                lastSwapchainCaptureBuffer_.buffer,
+                1,
+                &region);
+
+            TransitionImageLayout2(
+                cmd,
+                swapchainImages_[swapchainImageIndex],
+                VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                VK_ACCESS_2_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                0);
+            lastSwapchainCaptureWidth_ = swapchainExtent_.width;
+            lastSwapchainCaptureHeight_ = swapchainExtent_.height;
+        } else {
+            TransitionImageLayout2(
+                cmd,
+                swapchainImages_[swapchainImageIndex],
+                VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                0);
+        }
+    } else {
+        TransitionImageLayout2(
+            cmd,
+            swapchainImages_[swapchainImageIndex],
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+            0);
+    }
 
     vkEndCommandBuffer(cmd);
 
@@ -1501,6 +1724,9 @@ bool VulkanRenderer::RenderInteractiveFrame(
     if (presRes == VK_ERROR_OUT_OF_DATE_KHR || presRes == VK_SUBOPTIMAL_KHR) {
         vkDeviceWaitIdle(dev);
         CreateSwapchain(outError);
+    } else {
+        lastPresentedSwapchainImageIndex_ = swapchainImageIndex;
+        hasPresentedSwapchainFrame_ = true;
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -1569,6 +1795,31 @@ bool VulkanRenderer::ReadbackViewportColorRgba(creative::ImageData2D* outImage, 
 
     ctx_.DestroyBufferImmediate(readbackBuf);
     return ok;
+}
+
+bool VulkanRenderer::ReadbackSwapchainWindowRgba(creative::ImageData2D* outImage, std::string* outError) {
+    if (!initialized_ || !hasPresentedSwapchainFrame_ ||
+        lastSwapchainCaptureBuffer_.buffer == VK_NULL_HANDLE ||
+        lastSwapchainCaptureWidth_ == 0 || lastSwapchainCaptureHeight_ == 0 || !outImage) {
+        return ReadbackViewportColorRgba(outImage, outError);
+    }
+    vkDeviceWaitIdle(ctx_.GetDevice());
+
+    uint32_t w = lastSwapchainCaptureWidth_;
+    uint32_t h = lastSwapchainCaptureHeight_;
+    size_t byteSize = static_cast<size_t>(w) * h * 4ULL;
+
+    outImage->width = w;
+    outImage->height = h;
+    outImage->rgbaPixels.resize(byteSize);
+    std::memcpy(outImage->rgbaPixels.data(), lastSwapchainCaptureBuffer_.allocInfo.pMappedData, byteSize);
+
+    if (swapchainFormat_ == VK_FORMAT_B8G8R8A8_UNORM || swapchainFormat_ == VK_FORMAT_B8G8R8A8_SRGB) {
+        for (size_t i = 0; i + 3 < outImage->rgbaPixels.size(); i += 4) {
+            std::swap(outImage->rgbaPixels[i], outImage->rgbaPixels[i + 2]);
+        }
+    }
+    return true;
 }
 
 bool VulkanRenderer::ReadbackPickedObjectIdAtPixel(

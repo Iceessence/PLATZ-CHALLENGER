@@ -24,6 +24,8 @@ CommandRegistry::CommandRegistry() {
         {"object.create", "Scene", "Create a new canonical 3D SceneObject with validated transform and mesh", true},
         {"object.set_transform", "Scene", "Update position, rotationEulerDeg, or scale of a stable ObjectId", true},
         {"object.set_material", "Material", "Update PBR metallic, roughness, baseColor, or emissive parameters", true},
+        {"object.set_modifier_stack", "3D Modeling", "Update non-destructive 3D mesh modifier stack on a stable ObjectId", true},
+        {"object.set_material_graph", "Material", "Attach a validated Visual Material Node Graph JSON to a stable ObjectId", true},
         {"object.add_behavior_rule", "Logic", "Attach a validated no-code BehaviorRule to a stable ObjectId", true},
         {"object.delete", "Scene", "Delete a canonical SceneObject by stable ObjectId (requires allowDeleteObjects)", true}
     };
@@ -73,7 +75,6 @@ CommandValidationResult CommandRegistry::ValidateCommand(
     const TypedCommandRequest& request) const {
     CommandValidationResult res{};
 
-    // 1. Check for poisoned retrieval prompt injection (PLZ-SAFEX-001, N-19)
     std::string injectionReason;
     if (DetectPoisonedRetrievalInjection(request.untrustedRetrievedContext, &injectionReason)) {
         res.permissionDenied = true;
@@ -83,7 +84,6 @@ CommandValidationResult CommandRegistry::ValidateCommand(
         return res;
     }
 
-    // 2. Hard block financial, identity, or self-approval commands (PLZ-TRUST-003, PLZ-OPS-016, N-23)
     if (request.commandName == "model.self_approve" ||
         request.commandName == "release.promote_independently_accepted" ||
         request.commandName == "account.payment") {
@@ -93,28 +93,30 @@ CommandValidationResult CommandRegistry::ValidateCommand(
         return res;
     }
 
-    // 3. Verify command exists in registry (PLZ-SAFEX-007)
     if (!IsKnownCommand(request.commandName)) {
         res.errorCode = "ERR_UNKNOWN_COMMAND";
         res.diagnosticMessage = "Command '" + request.commandName + "' is not in the versioned CommandRegistry (PLZ-SAFEX-007)";
         return res;
     }
 
-    // 4. Verify host-enforced capability grants (PLZ-SAFEX-001)
     if (request.commandName == "project.query_object" && !hostGrant.allowReadProject) {
         res.permissionDenied = true;
         res.errorCode = "ERR_PERMISSION_DENIED";
         res.diagnosticMessage = "Host CapabilityGrant denies allowReadProject";
         return res;
     }
-    if ((request.commandName == "object.create" || request.commandName == "object.set_transform") &&
+    if ((request.commandName == "object.create" ||
+         request.commandName == "object.set_transform" ||
+         request.commandName == "object.set_modifier_stack") &&
         !hostGrant.allowMutateScene) {
         res.permissionDenied = true;
         res.errorCode = "ERR_PERMISSION_DENIED";
         res.diagnosticMessage = "Host CapabilityGrant denies allowMutateScene";
         return res;
     }
-    if (request.commandName == "object.set_material" && !hostGrant.allowMutateMaterials) {
+    if ((request.commandName == "object.set_material" ||
+         request.commandName == "object.set_material_graph") &&
+        !hostGrant.allowMutateMaterials) {
         res.permissionDenied = true;
         res.errorCode = "ERR_PERMISSION_DENIED";
         res.diagnosticMessage = "Host CapabilityGrant denies allowMutateMaterials";
@@ -133,7 +135,6 @@ CommandValidationResult CommandRegistry::ValidateCommand(
         return res;
     }
 
-    // 5. Verify revision head pinning (PLZ-ARCH-002, PLZ-AIX-007, N-02)
     if (request.expectedRevision != project.GetHeadRevision()) {
         res.staleRevision = true;
         res.errorCode = "ERR_STALE_REVISION";
@@ -143,7 +144,6 @@ CommandValidationResult CommandRegistry::ValidateCommand(
         return res;
     }
 
-    // 6. Verify target object identity for object-targeted commands (PLZ-ARCH-002, N-01, N-17)
     if (request.commandName != "object.create") {
         core::ObjectId resolvedId = request.targetObjectId;
         if (resolvedId == 0 && !request.targetObjectNameHint.empty()) {
@@ -176,7 +176,6 @@ CommandValidationResult CommandRegistry::ValidateCommand(
         }
     }
 
-    // 7. Validate command parameter schemas
     const auto& p = request.parameters;
     if (!p.is_object()) {
         res.errorCode = "ERR_INVALID_SCHEMA";
@@ -215,6 +214,18 @@ CommandValidationResult CommandRegistry::ValidateCommand(
         if (p.contains("roughness") && (!p["roughness"].is_number() || p["roughness"].get<float>() < 0.04f || p["roughness"].get<float>() > 1.0f)) {
             res.errorCode = "ERR_INVALID_SCHEMA";
             res.diagnosticMessage = "roughness must be a number in [0.04, 1.0]";
+            return res;
+        }
+    } else if (request.commandName == "object.set_modifier_stack") {
+        if (!p.contains("modifiers") || !p["modifiers"].is_array()) {
+            res.errorCode = "ERR_INVALID_SCHEMA";
+            res.diagnosticMessage = "object.set_modifier_stack requires a 'modifiers' array";
+            return res;
+        }
+    } else if (request.commandName == "object.set_material_graph") {
+        if (!p.contains("materialGraphJson") || !p["materialGraphJson"].is_string()) {
+            res.errorCode = "ERR_INVALID_SCHEMA";
+            res.diagnosticMessage = "object.set_material_graph requires string 'materialGraphJson'";
             return res;
         }
     } else if (request.commandName == "object.create") {
@@ -350,6 +361,20 @@ CommandValidationResult CommandRegistry::ValidateAndApplyCommand(
         if (p.contains("useProceduralChecker") && p["useProceduralChecker"].is_boolean()) {
             updated.material.useProceduralChecker = p["useProceduralChecker"].get<bool>();
         }
+    } else if (request.commandName == "object.set_modifier_stack") {
+        updated.mesh.modifierStack.clear();
+        for (const auto& mj : p["modifiers"]) {
+            core::MeshModifier mod;
+            mod.modifierId = mj.value("modifierId", "ai_mod_" + std::to_string(updated.mesh.modifierStack.size() + 1));
+            mod.modifierType = mj.value("modifierType", std::string("Subdivide"));
+            mod.enabled = mj.value("enabled", true);
+            mod.paramA = mj.value("paramA", 0.25f);
+            mod.paramB = mj.value("paramB", 1.0f);
+            mod.seed = mj.value("seed", 2026u);
+            updated.mesh.modifierStack.push_back(std::move(mod));
+        }
+    } else if (request.commandName == "object.set_material_graph") {
+        updated.material.materialGraphJson = p["materialGraphJson"].get<std::string>();
     } else if (request.commandName == "object.add_behavior_rule") {
         core::BehaviorRule rule;
         rule.ruleId = p.value("ruleId", "ai_rule_" + std::to_string(updated.logic.rules.size() + 1));

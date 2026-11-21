@@ -167,10 +167,21 @@ FSOutput fsMain(VSOutput input)
         Lo += (kD_pt * albedo / PI + spec_pt) * radiance_pt * NdotL_pt;
     }
 
-    // Hemisphere ambient lighting
+    // Hemisphere ambient diffuse + Studio Environment Specular Reflection (IBL approximation for conductors & dielectrics)
     float hemi = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
-    float3 skyAmb = lerp(gScene.skyHorizonColor.rgb * 0.45, gScene.skyTopColor.rgb, hemi);
-    float3 ambient = skyAmb * albedo * max(gScene.sunColor.a, 0.05);
+    float3 skyAmb = lerp(gScene.skyHorizonColor.rgb * 0.65, gScene.skyTopColor.rgb * 1.35, hemi);
+    float3 kS_amb = FresnelSchlick(max(dot(N, V), 0.0), F0);
+    float3 kD_amb = (1.0 - kS_amb) * (1.0 - metallic * 0.65);
+    float3 diffuseAmb = skyAmb * albedo * kD_amb * max(gScene.sunColor.a, 0.25);
+
+    float3 R = reflect(-V, N);
+    float reflHemi = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
+    float3 envSky = lerp(float3(0.22, 0.26, 0.34), float3(0.68, 0.78, 0.95), pow(reflHemi, 0.8));
+    float sunReflLobe = pow(max(dot(R, L_sun), 0.0), lerp(32.0, 3.0, roughness));
+    float3 envRadiance = envSky + gScene.sunColor.rgb * sunReflLobe * 0.85;
+    float3 envSpec = envRadiance * kS_amb * (1.0 - roughness * 0.55) * lerp(0.35, 1.15, metallic);
+
+    float3 ambient = diffuseAmb + envSpec;
 
     float3 emissive = gObject.emissiveColor.rgb * emissiveStrength;
     float3 color = ambient + Lo + emissive;

@@ -25,6 +25,9 @@ int main(int argc, char* argv[]) {
     std::filesystem::path projectDir = platz::platform::GetRepoRootDir() / "projects" / "PLATZ-Validation";
     bool headless = false;
     int verifyFrames = 0;
+    float initialUiScale = 1.0f;
+    std::string workspaceArg;
+    std::string windowCapturePathArg;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -34,6 +37,12 @@ int main(int argc, char* argv[]) {
             headless = true;
         } else if (arg == "--verify-frames" && i + 1 < argc) {
             verifyFrames = std::max(1, std::atoi(argv[++i]));
+        } else if (arg == "--ui-scale" && i + 1 < argc) {
+            initialUiScale = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--workspace" && i + 1 < argc) {
+            workspaceArg = argv[++i];
+        } else if (arg == "--capture-window" && i + 1 < argc) {
+            windowCapturePathArg = argv[++i];
         }
     }
 
@@ -52,16 +61,15 @@ int main(int argc, char* argv[]) {
               << " (" << project.GetObjects().size() << " canonical objects, "
               << project.GetAssets().size() << " content-addressed assets).\n";
 
-    // 2. Initialize SDL3 Platform Window & Vulkan 1.4 Renderer
+    // 2. Initialize SDL3 Platform Window & Vulkan 1.4 Renderer at realistic 1920x1080 desktop resolution
     platz::platform::WindowConfig winCfg{};
     winCfg.title = "PLATZ Studio — " + project.GetProjectName() + " [Vulkan 1.4]";
-    winCfg.width = 1600;
-    winCfg.height = 920;
+    winCfg.width = 1920;
+    winCfg.height = 1040;
     winCfg.headless = headless;
 
     platz::platform::SdlWindow window;
     if (!window.Initialize(winCfg, &err)) {
-        // If running in a headless terminal session where Win32 display creation fails, fall back cleanly to headless Vulkan
         std::cout << "[PLATZ] Window creation note (" << err << "); continuing in headless Vulkan 1.4 mode.\n";
         winCfg.headless = true;
         window.Initialize(winCfg, &err);
@@ -93,6 +101,19 @@ int main(int argc, char* argv[]) {
         commandRegistry,
         stagedAiSession,
         specialistModel);
+
+    if (initialUiScale != 1.0f) {
+        studioUi.SetUiScale(initialUiScale);
+    }
+    if (workspaceArg == "materials") {
+        studioUi.SetWorkspaceMode(platz::studio::WorkspaceMode::MaterialsAndShaders);
+    } else if (workspaceArg == "pixel") {
+        studioUi.SetWorkspaceMode(platz::studio::WorkspaceMode::PixelArtAndSprites);
+    } else if (workspaceArg == "ai") {
+        studioUi.SetWorkspaceMode(platz::studio::WorkspaceMode::PlatzAiWorkbench);
+    } else if (workspaceArg == "model") {
+        studioUi.SetWorkspaceMode(platz::studio::WorkspaceMode::ModelAndAssets);
+    }
 
     auto lastTick = std::chrono::high_resolution_clock::now();
     bool running = true;
@@ -150,14 +171,25 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // If --verify-frames was requested, run the automated validation route, capture GPU readback frame, and write receipt
     if (verifyFrames > 0) {
         auto routeReceipt = platz::studio::ValidationWorldManager::RunAutomatedVerificationRoute(project);
+
+        // 1. Capture raw 3D offscreen viewport image
         platz::creative::ImageData2D frameCapture;
         bool readbackOk = renderer.ReadbackViewportColorRgba(&frameCapture, &err);
         std::filesystem::path capturePath = platz::platform::GetRepoRootDir() / "out" / "verification_viewport_capture.png";
         if (readbackOk) {
             platz::creative::TextureGenerator::WriteImageToPng(frameCapture, capturePath);
+        }
+
+        // 2. Capture full composed Studio application window swapchain image
+        platz::creative::ImageData2D windowCapture;
+        bool winReadbackOk = renderer.ReadbackSwapchainWindowRgba(&windowCapture, &err);
+        std::filesystem::path winCapturePath = windowCapturePathArg.empty()
+            ? (platz::platform::GetRepoRootDir() / "out" / "verification_studio_window.png")
+            : std::filesystem::path(windowCapturePathArg);
+        if (winReadbackOk) {
+            platz::creative::TextureGenerator::WriteImageToPng(windowCapture, winCapturePath);
         }
 
         const auto& perf = renderer.GetPerfMetrics();
@@ -173,7 +205,9 @@ int main(int argc, char* argv[]) {
             {"validationLayerActive", renderer.GetContext().IsValidationActive()},
             {"validationErrorCount", renderer.GetContext().GetValidationErrorCount()},
             {"framesRendered", framesRendered},
+            {"windowResolution", {windowCapture.width, windowCapture.height}},
             {"viewportResolution", {renderer.GetViewportWidth(), renderer.GetViewportHeight()}},
+            {"uiDpiScaleFactor", studioUi.GetUiScale()},
             {"lastCpuFrameTimeMs", perf.cpuFrameTimeMs},
             {"lastGpuScenePassTimeMs", perf.gpuScenePassTimeMs},
             {"drawCallCount", perf.drawCallCount},
@@ -181,7 +215,9 @@ int main(int argc, char* argv[]) {
             {"vmaActiveAllocatedBytes", budget.activeAllocatedBytes},
             {"vmaPeakAllocatedBytes", budget.peakAllocatedBytes},
             {"validationWorldRoute", routeReceipt.ToJson()},
-            {"specialistModelReceipt", specialistModel.GetActiveReceipt().ToJson()},
+            {"materialSpecialistReceipt", specialistModel.GetActiveReceipt().ToJson()},
+            {"gameplaySpecialistReceipt", studioUi.GetGameplaySpecialist().GetActiveReceipt().ToJson()},
+            {"studioWindowCapturePng", winCapturePath.string()},
             {"viewportCapturePng", capturePath.string()},
             {"timestampUtc", platz::platform::UtcIso8601Now()}
         };
@@ -196,6 +232,7 @@ int main(int argc, char* argv[]) {
                   << " (CPU=" << perf.cpuFrameTimeMs << " ms, GPU=" << perf.gpuScenePassTimeMs
                   << " ms, ValidationErrors=" << renderer.GetContext().GetValidationErrorCount()
                   << ", StationsPassed=" << routeReceipt.stationsPassed << "/" << routeReceipt.stationsVisited << ")\n";
+        std::cout << "[PLATZ VERIFY] Studio Window Screenshot: " << winCapturePath.string() << "\n";
         std::cout << "[PLATZ VERIFY] Receipt written to: " << receiptPath.string() << "\n";
 
         if (!routeReceipt.allStationsPassed || renderer.GetContext().GetValidationErrorCount() > 0) {

@@ -13,7 +13,6 @@ std::vector<LogicDiagnostic> RuntimeSession::ValidateProjectLogic(const core::Pr
     for (const auto& obj : project.GetObjects()) {
         std::set<std::pair<std::string, std::string>> stateEdges;
         for (const auto& rule : obj.logic.rules) {
-            // Check for missing or invalid targetObjectId when action requires a target
             if ((rule.actionType == "TransferInventory" || rule.triggerType == "OnProximity") &&
                 rule.targetObjectId != 0) {
                 if (!project.FindObject(rule.targetObjectId)) {
@@ -35,7 +34,6 @@ std::vector<LogicDiagnostic> RuntimeSession::ValidateProjectLogic(const core::Pr
                     "TransferInventory requires a distinct valid targetObjectId (N-16)"
                 });
             }
-            // Check for unreachable / contradictory condition
             if (rule.conditionExpr == "unreachable" || rule.conditionExpr == "false" ||
                 (!rule.requiredState.empty() && rule.requiredState == "__UNREACHABLE__")) {
                 diags.push_back({
@@ -46,7 +44,6 @@ std::vector<LogicDiagnostic> RuntimeSession::ValidateProjectLogic(const core::Pr
                     "Rule contains unreachable state or always-false condition (N-16)"
                 });
             }
-            // Check for immediate self-loop cycle on same tick without guard
             if (rule.actionType == "TransitionState" && !rule.requiredState.empty() && !rule.targetState.empty()) {
                 if (rule.requiredState == rule.targetState) {
                     diags.push_back({
@@ -77,24 +74,25 @@ std::vector<LogicDiagnostic> RuntimeSession::ValidateProjectLogic(const core::Pr
 bool RuntimeSession::StartPlay(const core::ProjectState& canonicalProject, std::string* outError) {
     StopPlay();
 
-    // Clone canonical objects into isolated runtime projection (PLZ-RUNTIME-001, N-07)
     runtimeObjects_ = canonicalProject.GetObjects();
     sourceAuthoringRevision_ = canonicalProject.GetHeadRevision();
     metrics_ = {};
     eventTraceLog_.clear();
+    debuggerTimeline_.clear();
     playing_ = true;
     paused_ = false;
 
     AppendTrace("Started isolated Play session from authoring revision r" + std::to_string(sourceAuthoringRevision_));
 
-    // Fire OnStart rules
     for (auto& obj : runtimeObjects_) {
         obj.transform.Sanitize();
         for (const auto& rule : obj.logic.rules) {
             if (rule.triggerType == "OnStart") {
                 ++metrics_.rulesEvaluatedCount;
                 if (EvaluateRuleCondition(obj, rule)) {
+                    std::string beforeState = obj.logic.currentState;
                     ExecuteRuleAction(obj, rule, 0.0);
+                    RecordDebuggerTimelineEntry(obj, rule, beforeState);
                     ++metrics_.rulesTriggeredCount;
                 }
             }
@@ -152,6 +150,29 @@ void RuntimeSession::AppendTrace(const std::string& msg) {
     eventTraceLog_.push_back(msg);
 }
 
+void RuntimeSession::RecordDebuggerTimelineEntry(
+    const core::SceneObject& self,
+    const core::BehaviorRule& rule,
+    const std::string& stateBefore) {
+    if (debuggerTimeline_.size() >= 256) {
+        debuggerTimeline_.erase(debuggerTimeline_.begin());
+    }
+    RuleDebuggerTimelineEntry entry;
+    entry.stepIndex = metrics_.stepCount;
+    entry.timestampSec = metrics_.elapsedPlayTimeSec;
+    entry.objectId = self.id;
+    entry.objectName = self.name;
+    entry.ruleId = rule.ruleId;
+    entry.triggerType = rule.triggerType;
+    entry.actionType = rule.actionType;
+    entry.stateBefore = stateBefore;
+    entry.stateAfter = self.logic.currentState;
+    entry.positionAfter = self.transform.position;
+    auto it = self.logic.inventory.find("energy_crystal");
+    entry.energyCrystalsAfter = (it != self.logic.inventory.end()) ? it->second : 0;
+    debuggerTimeline_.push_back(std::move(entry));
+}
+
 bool RuntimeSession::EvaluateRuleCondition(const core::SceneObject& self, const core::BehaviorRule& rule) const {
     if (rule.conditionExpr == "false" || rule.conditionExpr == "unreachable") {
         return false;
@@ -198,6 +219,22 @@ void RuntimeSession::ExecuteRuleAction(core::SceneObject& self, const core::Beha
         float angle = static_cast<float>(metrics_.elapsedPlayTimeSec) * angularSpeed;
         self.transform.position.x = std::cos(angle) * radius;
         self.transform.position.z = std::sin(angle) * radius;
+    } else if (rule.actionType == "PatrolWaypoints") {
+        // Patrol back and forth along X/Z span around origin_x
+        float span = (std::abs(rule.paramA) > 0.1f) ? rule.paramA : 2.5f;
+        float speed = (std::abs(rule.paramB) > 0.05f) ? rule.paramB : 1.4f;
+        float origX = self.transform.position.x;
+        auto it = self.logic.variables.find("origin_x");
+        if (it != self.logic.variables.end()) {
+            origX = static_cast<float>(it->second);
+        } else {
+            self.logic.variables["origin_x"] = origX;
+        }
+        self.transform.position.x = origX + std::sin(static_cast<float>(metrics_.elapsedPlayTimeSec) * speed) * span;
+        self.logic.variables["patrol_phase"] = std::sin(static_cast<float>(metrics_.elapsedPlayTimeSec) * speed);
+    } else if (rule.actionType == "ModifyVariable") {
+        std::string varName = rule.resourceName.empty() ? "score" : rule.resourceName;
+        self.logic.variables[varName] += static_cast<double>(rule.paramA) * dt;
     } else if (rule.actionType == "TransitionState") {
         if (!rule.targetState.empty() && self.logic.currentState != rule.targetState) {
             std::string oldState = self.logic.currentState;
@@ -223,7 +260,6 @@ void RuntimeSession::StepSimulation(double deltaSeconds) {
     if (!playing_ || paused_) return;
     if (!std::isfinite(deltaSeconds) || deltaSeconds < 0.0) return;
 
-    // Clamp extreme frame delta to prevent tunneling or instability (PLZ-GAME-004, N-10)
     double clampedDt = std::min(deltaSeconds, 0.1);
     constexpr double kFixedSubstep = 1.0 / 120.0;
     double remaining = clampedDt;
@@ -233,11 +269,9 @@ void RuntimeSession::StepSimulation(double deltaSeconds) {
         remaining -= dt;
         float fdt = static_cast<float>(dt);
 
-        // 1. Physics & Rigid Body integration with NaN/Inf protection (PLZ-GAME-004, N-10)
         for (auto& obj : runtimeObjects_) {
             if (!obj.physics.enabled || !obj.physics.isDynamic) continue;
 
-            // Sanitize velocities
             if (!std::isfinite(obj.physics.linearVelocity.x) ||
                 !std::isfinite(obj.physics.linearVelocity.y) ||
                 !std::isfinite(obj.physics.linearVelocity.z)) {
@@ -249,12 +283,10 @@ void RuntimeSession::StepSimulation(double deltaSeconds) {
                 obj.physics.linearVelocity = (obj.physics.linearVelocity / speed) * maxSpeed;
             }
 
-            // Gravity acceleration
             obj.physics.linearVelocity.y -= 9.81f * fdt;
             obj.transform.position += obj.physics.linearVelocity * fdt;
             obj.transform.rotationEulerDeg += obj.physics.angularVelocityDeg * fdt;
 
-            // Ground plane collision (Y = colliderHalfExtents.y * scale.y)
             float floorY = std::max(0.0f, obj.physics.colliderHalfExtents.y * std::abs(obj.transform.scale.y));
             if (obj.transform.position.y < floorY) {
                 obj.transform.position.y = floorY;
@@ -263,7 +295,6 @@ void RuntimeSession::StepSimulation(double deltaSeconds) {
                     if (std::abs(obj.physics.linearVelocity.y) < 0.15f) {
                         obj.physics.linearVelocity.y = 0.0f;
                     }
-                    // Horizontal friction damping
                     float damp = std::clamp(1.0f - obj.physics.friction * fdt * 4.0f, 0.0f, 1.0f);
                     obj.physics.linearVelocity.x *= damp;
                     obj.physics.linearVelocity.z *= damp;
@@ -277,13 +308,14 @@ void RuntimeSession::StepSimulation(double deltaSeconds) {
     metrics_.elapsedPlayTimeSec += clampedDt;
     ++metrics_.stepCount;
 
-    // 2. Evaluate OnTick and OnProximity behavior rules
     for (auto& obj : runtimeObjects_) {
         for (const auto& rule : obj.logic.rules) {
             if (rule.triggerType == "OnTick" || rule.triggerType == "OnProximity") {
                 ++metrics_.rulesEvaluatedCount;
                 if (EvaluateRuleCondition(obj, rule)) {
+                    std::string beforeState = obj.logic.currentState;
                     ExecuteRuleAction(obj, rule, clampedDt);
+                    RecordDebuggerTimelineEntry(obj, rule, beforeState);
                     ++metrics_.rulesTriggeredCount;
                 }
             }
@@ -301,7 +333,9 @@ bool RuntimeSession::TriggerInteraction(core::ObjectId objectId, std::string* ou
         if (rule.triggerType == "OnInteract") {
             ++metrics_.rulesEvaluatedCount;
             if (EvaluateRuleCondition(*obj, rule)) {
+                std::string beforeState = obj->logic.currentState;
                 ExecuteRuleAction(*obj, rule, 0.016);
+                RecordDebuggerTimelineEntry(*obj, rule, beforeState);
                 ++metrics_.rulesTriggeredCount;
                 anyTriggered = true;
             }
@@ -343,11 +377,9 @@ bool RuntimeSession::ExecuteConservedResourceTransfer(
         return false;
     }
 
-    // Begin atomic two-phase transfer (PLZ-ARCH-009, N-09)
     src->logic.inventory[resourceName] = srcBefore - amount;
 
     if (simulateInterruptionMidTransfer) {
-        // Rollback debit so total conserved resources across the world never drift or duplicate!
         src->logic.inventory[resourceName] = srcBefore;
         dst->logic.inventory[resourceName] = dstBefore;
         ++metrics_.conservedTransfersRolledBack;

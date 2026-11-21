@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+struct ImFont;
+
 namespace platz::platform {
 class SdlWindow;
 }
@@ -49,11 +51,13 @@ struct GpuMeshResource {
     uint32_t vertexCount{0};
     uint32_t indexCount{0};
     uint64_t assetGeneration{0};
+    std::string modifierSignature;
 };
 
 struct GpuTextureResource {
     VulkanImage image;
     VkSampler sampler{VK_NULL_HANDLE};
+    VkDescriptorSet imguiDescriptorSet{VK_NULL_HANDLE};
     uint64_t assetGeneration{0};
 };
 
@@ -110,8 +114,11 @@ public:
         const std::function<void()>& buildImGuiCallback,
         std::string* outError = nullptr);
 
-    // Read back rendered offscreen 3D viewport pixels from GPU to CPU (for headless tests & screenshot receipts)
+    // Read back rendered offscreen 3D viewport pixels from GPU to CPU
     bool ReadbackViewportColorRgba(creative::ImageData2D* outImage, std::string* outError = nullptr);
+
+    // Read back the full composed Studio application window from the last presented swapchain image
+    bool ReadbackSwapchainWindowRgba(creative::ImageData2D* outImage, std::string* outError = nullptr);
 
     // Read back exact 32-bit ObjectId from the GPU picking attachment at (pixelX, pixelY) (PLZ-RENDER-001, N-01)
     bool ReadbackPickedObjectIdAtPixel(
@@ -122,12 +129,35 @@ public:
 
     // Corrupt / clear derived GPU mesh & texture caches to verify transparent rebuild from canonical source (N-04, N-05)
     void InvalidateDerivedGpuCaches();
-    bool EnsureProjectGpuResourcesSynced(const core::ProjectState& project, std::string* outError = nullptr);
+    bool EnsureProjectGpuResourcesSynced(
+        const core::ProjectState& project,
+        const std::vector<core::SceneObject>& activeObjects,
+        std::string* outError = nullptr);
+
+    bool EnsureProjectGpuResourcesSynced(const core::ProjectState& project, std::string* outError = nullptr) {
+        return EnsureProjectGpuResourcesSynced(project, project.GetObjects(), outError);
+    }
 
     // Hot-reload PBR surface shader from Slang source code with safe fallback on compile error (N-13)
     bool HotReloadPbrShaderFromSlangSource(const std::string& slangSourceCode, std::string* outDiagnostic = nullptr);
 
+    // Upload or update live 2D Pixel-Art Sprite and Material Graph preview textures for UI & scene display
+    bool UpdatePixelArtPreviewTexture(const creative::ImageData2D& spriteImg, std::string* outError = nullptr);
+    bool UpdateMaterialGraphPreviewTexture(const creative::ImageData2D& graphImg, std::string* outError = nullptr);
+
     VkDescriptorSet GetViewportImGuiDescriptorSet() const { return viewportImGuiDescriptorSet_; }
+    VkDescriptorSet GetPixelArtImGuiDescriptorSet() const { return pixelArtPreviewTexture_.imguiDescriptorSet; }
+    VkDescriptorSet GetMaterialGraphImGuiDescriptorSet() const { return materialGraphPreviewTexture_.imguiDescriptorSet; }
+
+    ImFont* GetFontRegular() const { return fontRegular_; }
+    ImFont* GetFontBold() const { return fontBold_; }
+    ImFont* GetFontMono() const { return fontMono_; }
+
+    float GetSunAzimuthDeg() const { return sunAzimuthDeg_; }
+    void SetSunAzimuthDeg(float az) { sunAzimuthDeg_ = az; }
+    float GetSunElevationDeg() const { return sunElevationDeg_; }
+    void SetSunElevationDeg(float el) { sunElevationDeg_ = el; }
+
     uint32_t GetViewportWidth() const { return viewportWidth_; }
     uint32_t GetViewportHeight() const { return viewportHeight_; }
     const FramePerfMetrics& GetPerfMetrics() const { return perfMetrics_; }
@@ -181,6 +211,12 @@ private:
     VkSwapchainKHR swapchain_{VK_NULL_HANDLE};
     VkFormat swapchainFormat_{VK_FORMAT_B8G8R8A8_UNORM};
     VkExtent2D swapchainExtent_{0, 0};
+    bool swapchainSupportsTransferSrc_{false};
+    uint32_t lastPresentedSwapchainImageIndex_{0};
+    bool hasPresentedSwapchainFrame_{false};
+    VulkanBuffer lastSwapchainCaptureBuffer_{};
+    uint32_t lastSwapchainCaptureWidth_{0};
+    uint32_t lastSwapchainCaptureHeight_{0};
     std::vector<VkImage> swapchainImages_;
     std::vector<VkImageView> swapchainImageViews_;
     std::vector<VkSemaphore> swapchainRenderFinishedSemaphores_;
@@ -203,10 +239,21 @@ private:
     VkPipeline gridPipeline_{VK_NULL_HANDLE};
 
     // Built-in & Project-derived GPU caches
+    std::map<std::string, creative::MeshData> cpuPrimitiveBaseMeshes_;
     std::map<std::string, GpuMeshResource> primitiveMeshes_;
     std::map<core::AssetId, GpuMeshResource> customAssetMeshes_;
+    std::map<core::ObjectId, GpuMeshResource> modifiedObjectMeshes_;
     GpuMeshResource worldGridMesh_;
     GpuTextureResource defaultCalibrationTexture_;
+    GpuTextureResource pixelArtPreviewTexture_;
+    GpuTextureResource materialGraphPreviewTexture_;
+
+    ImFont* fontRegular_{nullptr};
+    ImFont* fontBold_{nullptr};
+    ImFont* fontMono_{nullptr};
+
+    float sunAzimuthDeg_{38.0f};
+    float sunElevationDeg_{56.0f};
 
     FramePerfMetrics perfMetrics_{};
 };

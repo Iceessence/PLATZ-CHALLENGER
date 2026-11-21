@@ -57,7 +57,6 @@ void MeshData::RecomputeBounds() {
         bmin = glm::min(bmin, v.position);
         bmax = glm::max(bmax, v.position);
     }
-    // Pad degenerate flat planes slightly for reliable ray picking
     glm::vec3 span = bmax - bmin;
     if (span.x < 0.04f) { bmin.x -= 0.02f; bmax.x += 0.02f; }
     if (span.y < 0.04f) { bmin.y -= 0.02f; bmax.y += 0.02f; }
@@ -66,34 +65,88 @@ void MeshData::RecomputeBounds() {
     localBounds.maxBounds = bmax;
 }
 
-bool MeshData::ValidateTopology(std::string* outDiagnostic) const {
+void MeshData::RecomputeSmoothNormals() {
+    if (vertices.empty() || indices.size() < 3 || (indices.size() % 3) != 0) return;
+    std::vector<glm::vec3> accum(vertices.size(), glm::vec3(0.0f));
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        uint32_t i0 = indices[i];
+        uint32_t i1 = indices[i + 1];
+        uint32_t i2 = indices[i + 2];
+        if (i0 >= vertices.size() || i1 >= vertices.size() || i2 >= vertices.size()) continue;
+        glm::vec3 e1 = vertices[i1].position - vertices[i0].position;
+        glm::vec3 e2 = vertices[i2].position - vertices[i0].position;
+        glm::vec3 fn = glm::cross(e1, e2);
+        accum[i0] += fn;
+        accum[i1] += fn;
+        accum[i2] += fn;
+    }
+    for (size_t v = 0; v < vertices.size(); ++v) {
+        float len = glm::length(accum[v]);
+        if (len > 1e-6f) {
+            vertices[v].normal = accum[v] / len;
+        }
+    }
+}
+
+MeshValidationReport MeshData::AnalyzeMeshQuality() const {
+    MeshValidationReport rep{};
+    rep.vertexCount = static_cast<uint32_t>(vertices.size());
+    rep.triangleCount = static_cast<uint32_t>(indices.size() / 3);
+    rep.dimensions = localBounds.maxBounds - localBounds.minBounds;
+
     if (vertices.empty() || indices.empty()) {
-        if (outDiagnostic) *outDiagnostic = "Mesh has zero vertices or indices";
-        return false;
+        rep.diagnostic = "Mesh has zero vertices or indices";
+        return rep;
     }
     if (indices.size() % 3 != 0) {
-        if (outDiagnostic) *outDiagnostic = "Triangle mesh index count is not divisible by 3";
-        return false;
+        rep.diagnostic = "Index count is not divisible by 3";
+        return rep;
     }
+
     uint32_t vCount = static_cast<uint32_t>(vertices.size());
     for (size_t i = 0; i < indices.size(); ++i) {
         if (indices[i] >= vCount) {
-            if (outDiagnostic) {
-                *outDiagnostic = "Index out of bounds at index[" + std::to_string(i) + "]=" +
-                                 std::to_string(indices[i]) + " (vertexCount=" + std::to_string(vCount) + ")";
-            }
-            return false;
+            ++rep.outOfBoundsIndexCount;
         }
     }
-    for (size_t i = 0; i < vertices.size(); ++i) {
-        const auto& v = vertices[i];
+    for (const auto& v : vertices) {
         if (!std::isfinite(v.position.x) || !std::isfinite(v.position.y) || !std::isfinite(v.position.z) ||
             !std::isfinite(v.normal.x) || !std::isfinite(v.normal.y) || !std::isfinite(v.normal.z)) {
-            if (outDiagnostic) *outDiagnostic = "Non-finite position or normal at vertex " + std::to_string(i);
-            return false;
+            ++rep.nonFiniteVertexCount;
         }
     }
-    return true;
+    if (rep.outOfBoundsIndexCount == 0) {
+        for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+            const glm::vec3& p0 = vertices[indices[i]].position;
+            const glm::vec3& p1 = vertices[indices[i + 1]].position;
+            const glm::vec3& p2 = vertices[indices[i + 2]].position;
+            float area2 = glm::length(glm::cross(p1 - p0, p2 - p0));
+            if (area2 < 1e-7f) {
+                ++rep.degenerateTriangleCount;
+            }
+        }
+    }
+
+    if (rep.outOfBoundsIndexCount > 0) {
+        rep.diagnostic = "Mesh has " + std::to_string(rep.outOfBoundsIndexCount) + " out-of-bounds indices";
+        return rep;
+    }
+    if (rep.nonFiniteVertexCount > 0) {
+        rep.diagnostic = "Mesh has " + std::to_string(rep.nonFiniteVertexCount) + " non-finite vertices";
+        return rep;
+    }
+
+    rep.valid = true;
+    rep.diagnostic = "Valid topology: " + std::to_string(rep.vertexCount) + " verts, " +
+                     std::to_string(rep.triangleCount) + " tris (" +
+                     std::to_string(rep.degenerateTriangleCount) + " degenerate)";
+    return rep;
+}
+
+bool MeshData::ValidateTopology(std::string* outDiagnostic) const {
+    auto rep = AnalyzeMeshQuality();
+    if (outDiagnostic) *outDiagnostic = rep.diagnostic;
+    return rep.valid;
 }
 
 std::vector<uint8_t> MeshData::SerializeToBinaryBlob() const {
@@ -167,12 +220,12 @@ MeshData MeshGenerator::GenerateCube(float size, const glm::vec3& vertexColor) {
         glm::vec3 up;
     };
     const FaceDef faces[6] = {
-        {{ 0,  0,  1}, { 1, 0, 0}, {0, 1, 0}}, // Front (+Z)
-        {{ 0,  0, -1}, {-1, 0, 0}, {0, 1, 0}}, // Back (-Z)
-        {{ 1,  0,  0}, { 0, 0,-1}, {0, 1, 0}}, // Right (+X)
-        {{-1,  0,  0}, { 0, 0, 1}, {0, 1, 0}}, // Left (-X)
-        {{ 0,  1,  0}, { 1, 0, 0}, {0, 0,-1}}, // Top (+Y)
-        {{ 0, -1,  0}, { 1, 0, 0}, {0, 0, 1}}  // Bottom (-Y)
+        {{ 0,  0,  1}, { 1, 0, 0}, {0, 1, 0}},
+        {{ 0,  0, -1}, {-1, 0, 0}, {0, 1, 0}},
+        {{ 1,  0,  0}, { 0, 0,-1}, {0, 1, 0}},
+        {{-1,  0,  0}, { 0, 0, 1}, {0, 1, 0}},
+        {{ 0,  1,  0}, { 1, 0, 0}, {0, 0,-1}},
+        {{ 0, -1,  0}, { 1, 0, 0}, {0, 0, 1}}
     };
 
     for (const auto& f : faces) {
@@ -247,7 +300,6 @@ MeshData MeshGenerator::GenerateCylinder(float radius, float height, int slices,
     slices = std::max(slices, 6);
     float halfH = height * 0.5f;
 
-    // Side wall
     for (int i = 0; i <= 1; ++i) {
         float y = (i == 0) ? -halfH : halfH;
         float v = 1.0f - static_cast<float>(i);
@@ -274,7 +326,6 @@ MeshData MeshGenerator::GenerateCylinder(float radius, float height, int slices,
         mesh.indices.push_back(t1);
     }
 
-    // Top cap
     uint32_t topCenter = static_cast<uint32_t>(mesh.vertices.size());
     mesh.vertices.push_back({{0.0f, halfH, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.5f, 0.5f}, vertexColor});
     for (int j = 0; j <= slices; ++j) {
@@ -288,7 +339,6 @@ MeshData MeshGenerator::GenerateCylinder(float radius, float height, int slices,
         mesh.indices.push_back(topCenter + 1 + j);
     }
 
-    // Bottom cap
     uint32_t botCenter = static_cast<uint32_t>(mesh.vertices.size());
     mesh.vertices.push_back({{0.0f, -halfH, 0.0f}, {0.0f, -1.0f, 0.0f}, {0.5f, 0.5f}, vertexColor});
     for (int j = 0; j <= slices; ++j) {
@@ -379,7 +429,6 @@ MeshData MeshGenerator::GenerateWorldGridLines(int halfExtent, float step) {
         bool isMajor = (i % 5 == 0);
         glm::vec3 col = isMajor ? glm::vec3(0.32f, 0.36f, 0.42f) : glm::vec3(0.18f, 0.20f, 0.24f);
 
-        // X axis line (at Z = 0)
         glm::vec3 xCol = (i == 0) ? glm::vec3(0.88f, 0.25f, 0.25f) : col;
         uint32_t baseX = static_cast<uint32_t>(grid.vertices.size());
         grid.vertices.push_back({{-maxCoord, 0.002f, coord}, {0, 1, 0}, {0, 0}, xCol});
@@ -387,7 +436,6 @@ MeshData MeshGenerator::GenerateWorldGridLines(int halfExtent, float step) {
         grid.indices.push_back(baseX);
         grid.indices.push_back(baseX + 1);
 
-        // Z axis line (at X = 0)
         glm::vec3 zCol = (i == 0) ? glm::vec3(0.22f, 0.55f, 0.95f) : col;
         uint32_t baseZ = static_cast<uint32_t>(grid.vertices.size());
         grid.vertices.push_back({{coord, 0.002f, -maxCoord}, {0, 1, 0}, {0, 0}, zCol});
@@ -401,7 +449,7 @@ MeshData MeshGenerator::GenerateWorldGridLines(int halfExtent, float step) {
 
 MeshData MeshGenerator::ApplySubdivisionModifier(const MeshData& source) {
     MeshData out;
-    out.name = source.name + "_Subdivided";
+    out.name = source.name + "_Subdiv";
     if (source.indices.size() < 3 || source.indices.size() % 3 != 0) {
         return source;
     }
@@ -427,14 +475,13 @@ MeshData MeshGenerator::ApplySubdivisionModifier(const MeshData& source) {
         Vertex3D m20 = midpoint(v2, v0);
 
         uint32_t base = static_cast<uint32_t>(out.vertices.size());
-        out.vertices.push_back(v0);  // 0
-        out.vertices.push_back(v1);  // 1
-        out.vertices.push_back(v2);  // 2
-        out.vertices.push_back(m01); // 3
-        out.vertices.push_back(m12); // 4
-        out.vertices.push_back(m20); // 5
+        out.vertices.push_back(v0);
+        out.vertices.push_back(v1);
+        out.vertices.push_back(v2);
+        out.vertices.push_back(m01);
+        out.vertices.push_back(m12);
+        out.vertices.push_back(m20);
 
-        // 4 sub-triangles
         out.indices.insert(out.indices.end(), {
             base + 0, base + 3, base + 5,
             base + 3, base + 1, base + 4,
@@ -444,6 +491,134 @@ MeshData MeshGenerator::ApplySubdivisionModifier(const MeshData& source) {
     }
     out.RecomputeBounds();
     return out;
+}
+
+MeshData MeshGenerator::ApplyBevelChamferModifier(const MeshData& source, float chamferAmount) {
+    MeshData out = source;
+    out.name = source.name + "_Bevel";
+    float amt = std::clamp(chamferAmount, -0.35f, 0.35f);
+    glm::vec3 center = (source.localBounds.minBounds + source.localBounds.maxBounds) * 0.5f;
+
+    for (auto& v : out.vertices) {
+        glm::vec3 radial = v.position - center;
+        float rLen = glm::length(radial);
+        glm::vec3 rDir = (rLen > 1e-5f) ? (radial / rLen) : v.normal;
+        // Spherize/chamfer sharp corners smoothly toward radial normal envelope
+        v.position = glm::mix(v.position, center + rDir * rLen, amt);
+        v.normal = glm::normalize(glm::mix(v.normal, rDir, std::abs(amt) * 0.65f));
+    }
+    out.RecomputeBounds();
+    return out;
+}
+
+MeshData MeshGenerator::ApplyTaperTwistModifier(const MeshData& source, float twistAngleDeg, float taperFactor) {
+    MeshData out = source;
+    out.name = source.name + "_TaperTwist";
+    float minY = source.localBounds.minBounds.y;
+    float maxY = source.localBounds.maxBounds.y;
+    float spanY = std::max(maxY - minY, 0.01f);
+    float twistRadTotal = glm::radians(twistAngleDeg);
+    float safeTaper = std::clamp(taperFactor, 0.15f, 2.5f);
+
+    for (auto& v : out.vertices) {
+        float t = std::clamp((v.position.y - minY) / spanY, 0.0f, 1.0f);
+        float profileScale = glm::mix(1.0f, safeTaper, t);
+        float angle = (t - 0.5f) * twistRadTotal;
+        float c = std::cos(angle);
+        float s = std::sin(angle);
+
+        float x = v.position.x * profileScale;
+        float z = v.position.z * profileScale;
+        v.position.x = x * c - z * s;
+        v.position.z = x * s + z * c;
+
+        float nx = v.normal.x;
+        float nz = v.normal.z;
+        v.normal.x = nx * c - nz * s;
+        v.normal.z = nx * s + nz * c;
+        float nLen = glm::length(v.normal);
+        if (nLen > 1e-5f) v.normal /= nLen;
+    }
+    out.RecomputeBounds();
+    return out;
+}
+
+MeshData MeshGenerator::ApplyMirrorXModifier(const MeshData& source, float mirrorOffset) {
+    MeshData out = source;
+    out.name = source.name + "_MirrorX";
+    float off = std::abs(mirrorOffset);
+
+    // Shift original to +X side
+    for (auto& v : out.vertices) {
+        v.position.x += off;
+    }
+
+    uint32_t baseCount = static_cast<uint32_t>(source.vertices.size());
+    size_t origIdxCount = source.indices.size();
+
+    for (const auto& v : source.vertices) {
+        Vertex3D mv = v;
+        mv.position.x = -(v.position.x + off);
+        mv.normal.x = -v.normal.x;
+        out.vertices.push_back(mv);
+    }
+
+    // Reverse triangle winding on mirrored half to preserve outward normals
+    for (size_t i = 0; i + 2 < origIdxCount; i += 3) {
+        out.indices.push_back(baseCount + source.indices[i]);
+        out.indices.push_back(baseCount + source.indices[i + 2]);
+        out.indices.push_back(baseCount + source.indices[i + 1]);
+    }
+
+    out.RecomputeBounds();
+    return out;
+}
+
+MeshData MeshGenerator::ApplyVertexNoiseDisplaceModifier(
+    const MeshData& source,
+    float amplitude,
+    float frequency,
+    uint32_t seed) {
+    MeshData out = source;
+    out.name = source.name + "_Displaced";
+    float phase = static_cast<float>(seed % 1024u) * 0.137f;
+
+    for (auto& v : out.vertices) {
+        float n = std::sin(v.position.x * frequency + phase) *
+                  std::cos(v.position.y * frequency * 1.13f - phase) *
+                  std::sin(v.position.z * frequency * 0.89f + phase * 0.5f);
+        v.position += v.normal * (n * amplitude);
+    }
+    out.RecomputeSmoothNormals();
+    out.RecomputeBounds();
+    return out;
+}
+
+MeshData MeshGenerator::EvaluateModifierStack(
+    const MeshData& baseMesh,
+    const std::vector<core::MeshModifier>& stack) {
+    MeshData current = baseMesh;
+    int subdivCount = 0;
+    for (const auto& mod : stack) {
+        if (!mod.enabled) continue;
+        if (mod.modifierType == "Subdivide") {
+            // Cap recursive subdivisions at 3 levels to protect real-time budget
+            if (subdivCount < 3) {
+                current = ApplySubdivisionModifier(current);
+                ++subdivCount;
+            }
+        } else if (mod.modifierType == "BevelChamfer") {
+            current = ApplyBevelChamferModifier(current, mod.paramA);
+        } else if (mod.modifierType == "TaperTwist") {
+            current = ApplyTaperTwistModifier(current, mod.paramA, mod.paramB);
+        } else if (mod.modifierType == "MirrorX") {
+            current = ApplyMirrorXModifier(current, mod.paramA);
+        } else if (mod.modifierType == "VertexNoiseDisplace") {
+            current = ApplyVertexNoiseDisplaceModifier(current, mod.paramA, mod.paramB, mod.seed);
+        }
+    }
+    current.RecomputeBounds();
+    return current;
 }
 
 } // namespace platz::creative

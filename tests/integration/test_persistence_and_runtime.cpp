@@ -140,6 +140,7 @@ TEST_CASE("J-02, N-07, N-08, N-09: Isolated Play/Stop, Gameplay Checkpoints, and
     // Step simulation (clamped to 0.1s max frame step * 90 deg/s = 9.0 deg) and verify runtime object rotated
     rt.StepSimulation(0.5);
     CHECK(rt.FindRuntimeObject(genId)->transform.rotationEulerDeg.y == doctest::Approx(9.0f));
+    CHECK_FALSE(rt.GetDebuggerTimeline().empty());
 
     // N-09: Conserved resource transfer (normal + simulated mid-transfer interruption)
     CHECK(rt.ComputeTotalResourceAcrossWorld("energy_crystal") == 150);
@@ -175,15 +176,15 @@ TEST_CASE("J-02, N-07, N-08, N-09: Isolated Play/Stop, Gameplay Checkpoints, and
     CHECK(proj.FindObject(vaultId)->logic.inventory["energy_crystal"] == 50);
 }
 
-TEST_CASE("J-06: Living Validation World (projects/PLATZ-Validation) All 6 Stations & Station Reset") {
+TEST_CASE("J-06: Living Validation World (projects/PLATZ-Validation) All 8 Stations & Station Reset") {
     std::filesystem::path valDir = platform::GetRepoRootDir() / "projects" / "PLATZ-Validation";
     core::ProjectState valProj;
     std::string err;
     REQUIRE(studio::ValidationWorldManager::EnsureValidationWorldPopulated(valProj, valDir, &err));
 
     auto receipt = studio::ValidationWorldManager::RunAutomatedVerificationRoute(valProj);
-    CHECK(receipt.stationsVisited == 6);
-    CHECK(receipt.stationsPassed == 6);
+    CHECK(receipt.stationsVisited == 8);
+    CHECK(receipt.stationsPassed == 8);
     CHECK(receipt.allStationsPassed);
 
     // PLZ-TEST-008: Reset a single station and re-verify

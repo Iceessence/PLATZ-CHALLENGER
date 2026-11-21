@@ -177,3 +177,63 @@ TEST_CASE("J-04 Universal Command Bar, Honest Backlog Status (PLZ-UXPLUS-008), a
     CHECK_FALSE(ui.InvokeCommandById("future.raytracing_pathtracer", &statusMsg));
     CHECK(statusMsg.find("BACKLOG") != std::string::npos);
 }
+
+TEST_CASE("Gate 4: Non-Destructive 3D Modifier Stack, Visual Material Node Graph -> Slang, 2D Pixel Canvas & 3-Role AI") {
+    // 1. Non-Destructive 3D Modifier Stack (PLZ-MODEL-005, PLZ-MODEL-012)
+    creative::MeshData baseCube = creative::MeshGenerator::GenerateCube(1.0f);
+    std::vector<core::MeshModifier> stack = {
+        {"m1", "Subdivide", true, 1.0f, 1.0f, 42},
+        {"m2", "TaperTwist", true, 60.0f, 0.55f, 42},
+        {"m3", "BevelChamfer", true, 0.12f, 1.0f, 42}
+    };
+    creative::MeshData evaluated = creative::MeshGenerator::EvaluateModifierStack(baseCube, stack);
+    auto quality = evaluated.AnalyzeMeshQuality();
+    CHECK(quality.valid);
+    CHECK(quality.triangleCount == (baseCube.indices.size() / 3) * 4);
+
+    // 2. Visual Material Node Graph Validation & Slang Compilation (PLZ-MAT-001, PLZ-RENDERX-002)
+    creative::MaterialGraphDocument graph;
+    CHECK(graph.ValidateGraph().valid);
+
+    std::string slangCode, failNode, err;
+    CHECK(graph.CompileToSlangShaderSource(&slangCode, &failNode, &err));
+    CHECK(slangCode.find("DistributionGGX") != std::string::npos);
+    CHECK(slangCode.find("graphFresnel") != std::string::npos);
+
+    // Introduce a broken node link and verify PLZ-RENDERX-002 reports the exact failing node ID
+    graph.FindNode("node_fresnel")->inputNodeA = "nonexistent_node_99";
+    auto badVal = graph.ValidateGraph();
+    CHECK_FALSE(badVal.valid);
+    CHECK(badVal.failingNodeId == "node_fresnel");
+
+    // 3. 2D Pixel-Art Canvas with Mirror-X Symmetry & Flood Fill (PLZ-ART-007, PLZ-ARCH-005)
+    creative::PixelArtCanvas canvas(16, 16);
+    canvas.SetIndex(2, 4, 5, /*mirrorX=*/true);
+    CHECK(canvas.GetIndex(2, 4) == 5);
+    CHECK(canvas.GetIndex(13, 4) == 5); // Mirrored across 16px width!
+    auto bakedSprite = canvas.BakeToImageData2D();
+    CHECK(bakedSprite.pixelExactNearest);
+    CHECK(bakedSprite.width == 16);
+
+    // 4. Coordinated 3-Role PLATZ AI Workflow + Dual Native Specialists (PLZ-AIX-003, PLZ-AIX-006)
+    core::ProjectState proj;
+    core::ObjectId targetId = proj.CreateObject("HeroDrone", "cube").id;
+
+    ai::NativeMaterialSpecialistModel matSpec;
+    std::vector<ai::TrainingSample> tr, ho;
+    ai::NativeMaterialSpecialistModel::BuildDefaultCuratedDataset(&tr, &ho);
+    ai::TrainingHyperparameters hp;
+    CHECK(matSpec.TrainAndEvaluate(tr, ho, hp).convergedAndQualified);
+
+    ai::NativeGameplayBalanceSpecialistModel gpSpec;
+    CHECK(gpSpec.TrainDefaultGameplaySpecialist().convergedAndQualified);
+
+    ai::CommandRegistry reg;
+    ai::StagedAiSession session(reg);
+    auto roleRec = ai::ThreeRoleCoordinator::PlanSynthesizeAndVerifyEnhancement(
+        proj, targetId, 1, 2, matSpec, gpSpec, session);
+    CHECK(roleRec.stagedSuccessfully);
+    CHECK(roleRec.commandsStaged == 2);
+    CHECK(session.ApproveAndCommit(roleRec.sessionToken, proj));
+    CHECK_FALSE(proj.FindObject(targetId)->logic.rules.empty());
+}

@@ -3,54 +3,52 @@
 - **Product:** PLATZ — One Place. Zero Limits.
 - **Repository:** `C:\PLATZ-CHALLENGER` (Strictly isolated from `C:\PLATZ`)
 - **Date:** 2026-11-21
-- **Current Verified Release Envelope:** **Gates 0, 1, 2, and 3 (`VERIFIED`)**
+- **Current Verified Release Envelope:** **Gates 0, 1, 2, 3, and Gate 4 Batch A (`VERIFIED`)**
 - **Verified Executable:** `C:\PLATZ-CHALLENGER\out\build\release\PLATZ.exe`
 
 ---
 
-## 1. Executive Summary of Verified Capabilities
+## 1. Executive Summary of Verified Capabilities & Studio UX Overhaul
 
-1. **Real Vulkan 1.4 Engine & VMA 3.5.0 GPU Ownership (`PLZ-RENDER-001..002`, `PLZ-FOUND-015..017`):**
-   - Negotiates Vulkan `1.4.351` directly on the host **NVIDIA GeForce RTX 5080** via `volk` `1.4.363.0` and `Vulkan-Headers` `1.4.363.0`.
-   - Uses Vulkan 1.4 **Dynamic Rendering** (`vkCmdBeginRendering`) and **Synchronization2** (`vkCmdPipelineBarrier2`) to render an offscreen 3D viewport color target (`VK_FORMAT_R8G8B8A8_UNORM`), a hardware object-ID picking attachment (`VK_FORMAT_R32_UINT`), and a 32-bit float depth buffer (`VK_FORMAT_D32_SFLOAT`), composited into the SDL3 (`3.4.20`) Studio window swapchain.
-   - All GPU buffers and images are managed through RAII handles over **VMA 3.5.0** with generation handles, frame-deferred destruction queues (`kMaxFramesInFlight = 2`), real-time VRAM budget tracking, and device-loss/contention recovery (`N-11`, `N-12`).
-   - Shaders are authored in **Slang** (`shaders/pbr_surface.slang`, `shaders/grid_sky.slang`), compiled to SPIR-V 1.5 via **`slangc.exe` `v2026.22.1`**, verified by `SpirvValidator`, and support live hot-reload with automatic last-known-good pipeline fallback on syntax or validation errors (`N-13`).
+1. **Professional Studio Workstation UI/UX, DockBuilder Layout & High-DPI Vector Typography (`PLZ-UX-001..013`, `PLZ-UXPLUS-001..008`, `J-04`, `N-24`, `N-29`):**
+   - **Coherent 5-Zone Programmatic `ImGui::DockBuilder` Layout:** Eliminates floating/overlapping windows and establishes a balanced, resizable, recoverable workstation:
+     - *Top Protected Ribbon:* Brand header (`PZ PLATZ STUDIO`), Menu bar, 5 Workspace Task Mode tabs (`1. World`, `2. 3D Mesh Lab`, `3. Material Graph`, `4. 2D Pixel Art`, `5. Logic & AI`), Play/Pause/Stop transport bar (`F5`), Universal Command Bar trigger (`Ctrl+K`), and the **Protected AI Approval & Emergency Stop Bar** (`PLZ-SAFEX-006` / `N-24`).
+     - *Left Dock (`22%` width):* Scene Outliner with quick creation buttons, search filter, one-click jump pills for all 8 Living Validation World stations (`ST-01`..`ST-08`), and unclipped object category badges (`Plane`, `Cylinder`, `Cube`, `Sphere`, `Torus`, `Light`, `MeshAsset`, `ModStack`, `Physics`).
+     - *Center Top (`68%` height):* Vulkan 1.4 3D Viewport with manipulation toolbar (`Move [W]`, `Rotate [E]`, `Scale [R]`, `Snap`, camera bookmarks, `Sun` elevation slider), 3D projected wireframe selection bounding box, interactive 3D X/Y/Z transform gizmo handles, floating object coordinate badge, and 3D orientation axis rose.
+     - *Right Dock (`26%` width):* Two-column non-clipping Property Inspector (`ImGui::BeginTable` with fixed label column and stretching value column) covering Object Identity, 3D Spatial Transform & Snapping, 3D Geometry & Non-Destructive Modifier Stack, Slang PBR Metallic-Roughness Material, and Rigid-Body Physics.
+     - *Center Bottom (`32%` height):* 5 unclipped creation tabs (`Asset Browser`, `Material Node Graph`, `2D Pixel & Sprite Studio`, `No-Code Logic & Debugger`, `PLATZ AI & Specialists`).
+   - **Scalable Vector Typography:** Crisp anti-aliased Windows TrueType fonts (`Segoe UI` regular/bold + `Consolas` monospace) verified at `1920x1040` across `100%`, `125%` High-DPI, and `150%` scaling.
 
-2. **Canonical SQLite 3.54.1 + Content-Addressed Asset Persistence (`PLZ-CORE-001..005`, `PLZ-ARCH-001..004`):**
-   - Structured project metadata, stable 64-bit `ObjectId`s, parent-child hierarchy transforms, revision history, and separate runtime gameplay checkpoints reside in `<ProjectDir>/project.platzdb` (**SQLite 3.54.1** in WAL mode).
-   - Binary 3D meshes and textures are staged to `assets/staging/*.tmp`, SHA-256 verified on disk, and atomically promoted to `assets/blobs/sha256/<first2>/<sha256>.blob` before advancing `head_revision_id`.
-   - Tested against simulated crashes mid-save (`N-03`), stale revision writes (`N-02`), duplicate object names (`N-01`), corrupt GPU caches (`N-04`), asset dependency invalidation (`N-05`), and incompatible future schema versions (`N-26`).
+2. **Real Vulkan 1.4 Engine, Studio Specular IBL & Non-Destructive 3D Modifier Stack (`PLZ-RENDER-001..002`, `PLZ-MODEL-001`, `PLZ-MODEL-004..005`, `PLZ-MODEL-012`):**
+   - Evaluates ordered, non-destructive 3D mesh modifier stacks (`Subdivide`, `TaperTwist`, `BevelChamfer`, `MirrorX`, `VertexNoiseDisplace`) with topology quality validation (`AnalyzeMeshQuality`) and incremental per-object GPU vertex/index buffer updates (`PLZ-ARCH-004`).
+   - Upgraded `shaders/pbr_surface.slang` with physically based GGX direct lighting + procedural Studio Environment Specular IBL reflection so high-metallic conductors (`Brushed Titanium`, `Polished Gold Torus`, `Twisted Spire`) render with realistic reflections.
 
-3. **Professional PLATZ Studio UI/UX & Accessibility (`PLZ-UX-001..013`, `PLZ-UXPLUS-001..008`, `N-24`, `N-29`):**
-   - Integrated dockable Studio built on SDL3 + Dear ImGui Docking (`1.93.0-docking`) with PZ Obsidian Dark and High-Contrast Accessible themes, scalable high-DPI typography (`100%–200%`), keyboard navigation, Universal Command Bar (`Ctrl+K`), 5 adaptive task workspaces, 3D viewport gizmo with snapping, Hierarchy, Inspector, PBR Material Editor, Asset Browser, No-Code Logic & HUD panel, PLATZ AI Staged Diff Workbench, and `AccessibilityAnnouncer` screen-reader log.
-   - Enforces **Protected Security Controls (`PLZ-SAFEX-006`, `N-24`)**: custom or malicious themes cannot hide or reduce the opacity/contrast of the AI Approval and Emergency Stop controls.
+3. **Visual Material Node Graph -> Slang 2026.22.1 Compiler & Live Vulkan Hot-Reload (`PLZ-MAT-001`, `PLZ-MAT-003`, `PLZ-MAT-006`, `PLZ-RENDERX-002`):**
+   - Interactive 2x2 visual node graph (`AlbedoColor` -> `CheckerPattern` -> `FresnelRim` -> `PbrOutput`) with bezier spline wires, cycle/broken-link diagnostics (`PLZ-RENDERX-002`), CPU 2D preview texture baker, and direct compilation to `.slang` -> SPIR-V 1.5 with live Vulkan pipeline hot-reload and last-known-good fallback (`N-13`).
 
-4. **Isolated Play Runtime, No-Code Logic & Conserved Gameplay Resources (`PLZ-RUNTIME-001..002`, `PLZ-LOGIC-001..008`, `PLZ-ARCH-009`):**
-   - Pressing Play (`F5`) clones canonical authoring state into an isolated runtime simulation (fixed-substep rigid-body gravity, bounce, friction, and `OnStart`/`OnTick`/`OnProximity`/`OnInteract` no-code rules).
-   - Stopping Play restores canonical authoring state cleanly (`N-07`), while gameplay checkpoints save and resume from `runtime_saves` (`N-08`).
-   - Conserved inventory transfers (`energy_crystal`) execute atomically and roll back cleanly on mid-transfer interruption (`N-09`).
+4. **Interactive 2D Pixel-Art & Sprite Studio (`PLZ-ART-001`, `PLZ-ART-007..009`, `PLZ-ARCH-005`, `N-14`):**
+   - `16x16` indexed-palette pixel-art canvas with Mirror-X symmetry painting, Flood Fill, Tile Grid stamper, razor-sharp `VK_FILTER_NEAREST` GPU preview, and content-addressed asset binding to 3D scene objects.
 
-5. **PLATZ AI Command Registry, Staged Sessions & Original Local Specialist Model (`PLZ-AI-001..015`, `PLZ-AIX-001..012`, `PLZ-SAFEX-001..011`):**
-   - All AI edits pass through the versioned `CommandRegistry` and revision-pinned `StagedAiSession` with before/after diffs, proportional logic/material validators (`PLZ-SAFEX-008`), selective approval, and scoped batch rollback after manual edits (`N-25`).
-   - **Emergency Stop (`N-18`)** immediately revokes session tokens and blocks late async commits.
-   - **Poisoned Retrieval Defense (`N-19`)** blocks prompt-injection privilege escalation inside retrieved text.
-   - **Original Local Specialist Model (`NativeMaterialSpecialistModel`):** A genuine, locally trained `12x24x7` neural network in native C++23 trained on rights-cleared PLATZ material/lighting data with an immutable hash-locked holdout evaluation split, privacy/consent enforcement (`N-22`), anti-self-approval gate (`N-23`), and negative result memory (`PLZ-AIX-012`).
+5. **Time-Inspectable Visual Logic Debugger & Dual Native PLATZ AI Specialists (`PLZ-LOGIC-008`, `PLZ-CREATEX2-004`, `PLZ-AIX-003..006`):**
+   - Records causal `RuleDebuggerTimelineEntry` snapshots during isolated Play mode with a Time-Travel Scrubber in the Studio UI.
+   - Features **two** locally trained from-scratch neural specialists in native C++23 (`12x24x7` `NativeMaterialSpecialistModel` + `10x20x5` `NativeGameplayBalanceSpecialistModel`, both achieving `100.0%` holdout accuracy in `< 1.2 ms` training time) orchestrated by the **3-Role Coordinated Intelligence Workflow** (*Coordinating Planner* -> *Domain Specialists* -> *Independent Critic & Verifier*).
 
 ---
 
 ## 2. Measured Hardware Benchmark & Verification Receipt
 
-Measured on **2026-11-21** via `C:\PLATZ-CHALLENGER\out\build\release\PLATZ.exe --project C:\PLATZ-CHALLENGER\projects\PLATZ-Validation --verify-frames 60` (`out/verification_receipt.json`):
+Measured on **2026-11-21** via `C:\PLATZ-CHALLENGER\out\build\release\PLATZ.exe --project C:\PLATZ-CHALLENGER\projects\PLATZ-Validation --verify-frames 35` (`out/verification_receipt.json`):
 
 | Metric | Measured Result | Conditions |
 | :--- | :--- | :--- |
 | **GPU & Driver** | **NVIDIA GeForce RTX 5080** (`Vulkan 1.4.351`, Driver `617.42`) | Discrete GPU, Dynamic Rendering + Synchronization2 |
-| **Window / Viewport Resolution** | `1600x920` Studio Swapchain / `1280x720` Offscreen 3D Viewport | `R8G8B8A8_UNORM` + `R32_UINT` Picking + `D32_SFLOAT` Depth |
+| **Window / Viewport Resolution** | `1920x1040` Studio Swapchain / `1280x720` Offscreen 3D Viewport | Verified at both `100%` and `125%` High-DPI scaling |
 | **Khronos Validation Layers** | **ACTIVE (`0` Errors, `0` Warnings)** | `VK_LAYER_KHRONOS_validation` (`1.4.363`) |
-| **Scene Complexity** | `14` Canonical 3D Objects, `15` Draw Calls, `8,362` Triangles | `projects/PLATZ-Validation` (All 6 stations active) |
-| **GPU 3D Scene Pass Time** | **`0.0190 ms`** (`18.98 us` via `VK_QUERY_TYPE_TIMESTAMP`) | 60-frame steady state, Release x64 |
-| **CPU Total Frame Time** | **`4.20 ms`** (~238 FPS unlocked; VSync FIFO swapchain) | Includes Offscreen 3D Pass + ImGui Docking UI + Swapchain Present |
-| **VMA GPU Memory Usage** | **`10.89 MB` Active** (`11,420,672` B) / **`14.41 MB` Peak** | All meshes, PBR textures, offscreen targets, and UBO rings |
-| **Native Specialist Training** | **`1.11 ms`** (`160` epochs, `30` train / `12` holdout samples) | Holdout MSE `0.14290 -> 0.00019`, Accuracy **`100.0%`**, Inference **`0.13 us`** |
+| **Scene Complexity** | `16` Canonical 3D Objects, `17` Draw Calls, `8,422` Triangles | `projects/PLATZ-Validation` (All 8 stations `ST-01..ST-08` active) |
+| **GPU 3D Scene Pass Time** | **`0.0215 ms`** (`21.47 us` via `VK_QUERY_TYPE_TIMESTAMP`) | Steady state, Release x64 |
+| **CPU Total Frame Time** | **`3.77 – 4.12 ms`** (~245 FPS unlocked; VSync FIFO swapchain) | Offscreen 3D Pass + Docked Studio UI + Swapchain Capture & Present |
+| **VMA GPU Memory Usage** | **`17.78 MB` Active** (`18,640,896` B) / **`18.14 MB` Peak** | Includes 3D meshes, modifier stack caches, textures & swapchain readback buffer |
+| **Native Specialist #1 (Material)** | **`1.11 ms` Train / `0.12 us` Inference** (`12x24x7` MLP) | Holdout MSE `0.14290 -> 0.00019`, Accuracy **`100.0%`** (`12` holdout samples) |
+| **Native Specialist #2 (Gameplay)** | **`0.78 ms` Train / `0.09 us` Inference** (`10x20x5` MLP) | Holdout MSE `0.07489 -> 0.00062`, Accuracy **`100.0%`** (`8` holdout samples) |
 | **CTest Verification Suites** | **`4 / 4` Suites Passed (`100%`)** in both `Release` and `Debug` | `platz_test_unit`, `platz_test_integration`, `platz_test_graphics`, `platz_test_security` |
-| **Living Validation World** | **`6 / 6` Stations Passed (`ST-01` through `ST-06`)** | Automated verification route receipt in `out/verification_receipt.json` |
+| **Living Validation World** | **`8 / 8` Stations Passed (`ST-01` through `ST-08`)** | Automated verification route receipt in `out/verification_receipt.json` |

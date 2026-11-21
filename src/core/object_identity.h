@@ -31,11 +31,22 @@ struct TransformComponent {
     glm::mat4 ToLocalMatrix() const;
 };
 
+// Non-destructive parametric 3D mesh modifier entry (PLZ-MODEL-004, PLZ-MODEL-005)
+struct MeshModifier {
+    std::string modifierId{"mod_1"};
+    std::string modifierType{"Subdivide"}; // "Subdivide", "BevelChamfer", "TaperTwist", "MirrorX", "VertexNoiseDisplace"
+    bool enabled{true};
+    float paramA{0.25f}; // e.g., twist angle (deg), chamfer amount, displacement amplitude
+    float paramB{1.0f};  // e.g., taper factor, noise frequency
+    uint32_t seed{2026u};
+};
+
 struct MeshComponent {
     std::string primitiveType{"cube"}; // "cube", "sphere", "cylinder", "plane", "torus", "custom_asset"
     AssetId meshAssetId{0};
     bool castShadows{true};
     bool visible{true};
+    std::vector<MeshModifier> modifierStack;
 };
 
 struct MaterialComponent {
@@ -48,6 +59,7 @@ struct MaterialComponent {
     float normalScale{1.0f};
     bool useProceduralChecker{false};
     AssetId albedoTextureAssetId{0};
+    std::string materialGraphJson{}; // Serialized visual material node graph (PLZ-MAT-001, PLZ-RENDERX-002)
 };
 
 struct LightComponent {
@@ -74,9 +86,9 @@ struct BehaviorRule {
     std::string ruleId{"rule_1"};
     std::string triggerType{"OnTick"};     // "OnTick", "OnStart", "OnProximity", "OnInteract", "OnResourceTransfer"
     std::string conditionExpr{"always"};   // "always", "state == 'Idle'", "state == 'Active'", "distance < 4.0", "inventory >= amount"
-    std::string actionType{"RotateY"};     // "RotateY", "BobVertical", "OrbitOrigin", "TransitionState", "AddInventory", "TransferInventory", "PulseEmissive"
-    float paramA{45.0f};                   // e.g. speed deg/s or amplitude or proximity radius
-    float paramB{1.5f};                    // e.g. frequency
+    std::string actionType{"RotateY"};     // "RotateY", "BobVertical", "OrbitOrigin", "PatrolWaypoints", "TransitionState", "AddInventory", "TransferInventory", "PulseEmissive", "ModifyVariable"
+    float paramA{45.0f};                   // e.g. speed deg/s or amplitude or proximity radius or patrol span
+    float paramB{1.5f};                    // e.g. frequency or patrol speed
     std::string requiredState{};
     std::string targetState{};
     std::string resourceName{"energy_crystal"};

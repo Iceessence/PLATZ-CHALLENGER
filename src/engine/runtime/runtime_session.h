@@ -16,6 +16,21 @@ struct LogicDiagnostic {
     std::string message;
 };
 
+// Time-inspectable visual gameplay debugging frame entry (PLZ-LOGIC-008, PLZ-CREATEX2-004)
+struct RuleDebuggerTimelineEntry {
+    uint64_t stepIndex{0};
+    double timestampSec{0.0};
+    core::ObjectId objectId{0};
+    std::string objectName;
+    std::string ruleId;
+    std::string triggerType;
+    std::string actionType;
+    std::string stateBefore;
+    std::string stateAfter;
+    glm::vec3 positionAfter{0.0f};
+    int64_t energyCrystalsAfter{0};
+};
+
 struct RuntimeExecutionMetrics {
     uint64_t stepCount{0};
     double elapsedPlayTimeSec{0.0};
@@ -56,7 +71,6 @@ public:
     bool TriggerInteraction(core::ObjectId objectId, std::string* outEventLog = nullptr);
 
     // Transactional conserved inventory/resource transfer (PLZ-GAME-010, PLZ-ARCH-009, N-09)
-    // Guarantees total sum of resourceName across all runtime objects is strictly invariant even if interrupted!
     bool ExecuteConservedResourceTransfer(
         core::ObjectId fromObjectId,
         core::ObjectId toObjectId,
@@ -85,9 +99,14 @@ public:
 
     const RuntimeExecutionMetrics& GetMetrics() const { return metrics_; }
     const std::vector<std::string>& GetEventTraceLog() const { return eventTraceLog_; }
+    const std::vector<RuleDebuggerTimelineEntry>& GetDebuggerTimeline() const { return debuggerTimeline_; }
 
 private:
     void AppendTrace(const std::string& msg);
+    void RecordDebuggerTimelineEntry(
+        const core::SceneObject& self,
+        const core::BehaviorRule& rule,
+        const std::string& stateBefore);
     bool EvaluateRuleCondition(const core::SceneObject& self, const core::BehaviorRule& rule) const;
     void ExecuteRuleAction(core::SceneObject& self, const core::BehaviorRule& rule, double dt);
 
@@ -97,6 +116,7 @@ private:
     std::vector<core::SceneObject> runtimeObjects_;
     RuntimeExecutionMetrics metrics_{};
     std::vector<std::string> eventTraceLog_;
+    std::vector<RuleDebuggerTimelineEntry> debuggerTimeline_;
 };
 
 } // namespace platz::engine::runtime
